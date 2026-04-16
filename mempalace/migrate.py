@@ -241,8 +241,11 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     try:
         os.rename(temp_palace, palace_path)
     except OSError:
-        # os.rename fails across filesystems; fall back to move
-        shutil.move(temp_palace, palace_path)
+        try:
+            shutil.move(temp_palace, palace_path)
+        except Exception:
+            os.rename(stale_path, palace_path)
+            raise
     shutil.rmtree(stale_path, ignore_errors=True)
 
     print("\n  Migration complete.")

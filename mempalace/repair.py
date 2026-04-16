@@ -254,8 +254,8 @@ def rebuild_index(palace_path=None):
 
     # Back up ONLY the SQLite database, not the bloated HNSW files
     sqlite_path = os.path.join(palace_path, "chroma.sqlite3")
+    backup_path = sqlite_path + ".backup"
     if os.path.exists(sqlite_path):
-        backup_path = sqlite_path + ".backup"
         print(f"  Backing up chroma.sqlite3 ({os.path.getsize(sqlite_path) / 1e6:.0f} MB)...")
         shutil.copy2(sqlite_path, backup_path)
         print(f"  Backup: {backup_path}")
