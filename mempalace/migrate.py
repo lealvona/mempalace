@@ -231,10 +231,19 @@ def migrate(palace_path: str, dry_run: bool = False, confirm: bool = False):
     del col
     del fresh_backend
 
-    # Swap: remove old palace, move new one into place
+    # Swap: rename old palace aside, then move new one into place.
+    # This avoids a window where both old and new are missing.
     print("  Swapping old palace for migrated version...")
-    shutil.rmtree(palace_path)
-    shutil.move(temp_palace, palace_path)
+    stale_path = palace_path + ".old"
+    if os.path.exists(stale_path):
+        shutil.rmtree(stale_path)
+    os.rename(palace_path, stale_path)
+    try:
+        os.rename(temp_palace, palace_path)
+    except OSError:
+        # os.rename fails across filesystems; fall back to move
+        shutil.move(temp_palace, palace_path)
+    shutil.rmtree(stale_path, ignore_errors=True)
 
     print("\n  Migration complete.")
     print(f"  Drawers migrated: {final_count}")
