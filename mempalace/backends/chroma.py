@@ -130,6 +130,37 @@ def quarantine_stale_hnsw(palace_path: str, stale_seconds: float = 3600.0) -> li
     return moved
 
 
+def _pin_hnsw_threads(collection) -> None:
+    """Best-effort retrofit: pin ``hnsw:num_threads=1`` on an existing collection.
+
+    Fresh collections set this via ``metadata=`` at creation. Legacy palaces
+    built before that change keep the default (parallel insert) and can hit
+    the HNSW race described in #974/#965. ChromaDB's
+    ``collection.modify(configuration=...)`` lets us re-apply ``num_threads=1``
+    in memory at load time so every new process is protected.
+
+    Note: in chromadb 1.5.x the modified ``configuration_json["hnsw"]`` does
+    not persist to disk across ``PersistentClient`` reopens, so this must
+    run on every ``get_collection`` call, not just once.
+    """
+    try:
+        from chromadb.api.collection_configuration import (
+            UpdateCollectionConfiguration,
+            UpdateHNSWConfiguration,
+        )
+    except ImportError:
+        logger.debug("_pin_hnsw_threads skipped: chromadb too old", exc_info=True)
+        return
+    try:
+        collection.modify(
+            configuration=UpdateCollectionConfiguration(
+                hnsw=UpdateHNSWConfiguration(num_threads=1)
+            )
+        )
+    except Exception:
+        logger.debug("_pin_hnsw_threads modify failed", exc_info=True)
+
+
 def _fix_blob_seq_ids(palace_path: str) -> None:
     """Fix ChromaDB 0.6.x -> 1.5.x migration bug: BLOB seq_ids -> INTEGER.
 
@@ -572,6 +603,7 @@ class ChromaBackend(BaseBackend):
             )
         else:
             collection = client.get_collection(collection_name, **ef_kwargs)
+        _pin_hnsw_threads(collection)
         return ChromaCollection(collection)
 
     def close_palace(self, palace) -> None:
