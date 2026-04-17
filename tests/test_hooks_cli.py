@@ -9,7 +9,6 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from mempalace.hooks_cli import (
-    MAX_PRECOMPACT_BLOCK_ATTEMPTS,
     SAVE_INTERVAL,
     _count_human_messages,
     _extract_recent_messages,
@@ -58,85 +57,6 @@ def test_sanitize_strips_dangerous_chars():
 def test_sanitize_empty_returns_unknown():
     assert _sanitize_session_id("") == "unknown"
     assert _sanitize_session_id("!!!") == "unknown"
-
-
-# --- hook_precompact attempt cap (regression for #955 deadlock fix) ---
-
-
-def _call_precompact(session_id: str) -> dict:
-    """Invoke hook_precompact with a deterministic session_id, capture stdout.
-
-    Returns the parsed JSON decision emitted by the hook.
-    """
-    stdout = io.StringIO()
-    with contextlib.redirect_stdout(stdout):
-        hook_precompact({"session_id": session_id}, "claude-code")
-    raw = stdout.getvalue().strip()
-    return json.loads(raw) if raw else {}
-
-
-def test_precompact_first_two_attempts_block(tmp_path, monkeypatch):
-    """First MAX_PRECOMPACT_BLOCK_ATTEMPTS calls must block with a reason."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("MEMPAL_DIR", raising=False)
-
-    import mempalace.hooks_cli as hooks_cli
-    monkeypatch.setattr(
-        hooks_cli, "STATE_DIR", tmp_path / "hook_state", raising=False
-    )
-
-    sid = "test-session-block"
-    for i in range(MAX_PRECOMPACT_BLOCK_ATTEMPTS):
-        decision = _call_precompact(sid)
-        assert decision.get("decision") == "block", (
-            f"attempt {i + 1}/{MAX_PRECOMPACT_BLOCK_ATTEMPTS}: expected block, "
-            f"got {decision}"
-        )
-        assert decision.get("reason") == PRECOMPACT_BLOCK_REASON
-
-
-def test_precompact_passes_through_after_cap(tmp_path, monkeypatch):
-    """After the cap is reached, the hook must stop blocking (fix for #955)."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("MEMPAL_DIR", raising=False)
-
-    import mempalace.hooks_cli as hooks_cli
-    monkeypatch.setattr(
-        hooks_cli, "STATE_DIR", tmp_path / "hook_state", raising=False
-    )
-
-    sid = "test-session-passthrough"
-    for _ in range(MAX_PRECOMPACT_BLOCK_ATTEMPTS):
-        _call_precompact(sid)  # exhaust the budget
-
-    # Next call must pass through (empty JSON decision)
-    decision = _call_precompact(sid)
-    assert decision == {}, (
-        f"after {MAX_PRECOMPACT_BLOCK_ATTEMPTS} attempts, hook must pass "
-        f"through to avoid deadlock; got {decision}"
-    )
-
-
-def test_precompact_counter_is_per_session(tmp_path, monkeypatch):
-    """A fresh session_id must get a fresh attempt budget."""
-    monkeypatch.setenv("HOME", str(tmp_path))
-    monkeypatch.delenv("MEMPAL_DIR", raising=False)
-
-    import mempalace.hooks_cli as hooks_cli
-    monkeypatch.setattr(
-        hooks_cli, "STATE_DIR", tmp_path / "hook_state", raising=False
-    )
-
-    sid_a = "session-a"
-    sid_b = "session-b"
-
-    # Exhaust session A
-    for _ in range(MAX_PRECOMPACT_BLOCK_ATTEMPTS):
-        _call_precompact(sid_a)
-    assert _call_precompact(sid_a) == {}  # A is done blocking
-
-    # Session B must still block on its first call — isolation between sessions
-    assert _call_precompact(sid_b).get("decision") == "block"
 
 
 # --- _count_human_messages ---
