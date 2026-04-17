@@ -311,27 +311,33 @@ def mine_lock(source_file: str):
 
 
 class MineAlreadyRunning(RuntimeError):
-    """Raised when another `mempalace mine` process already holds the global lock."""
+    """Raised when another `mempalace mine` already holds the per-palace lock."""
 
 
 @contextlib.contextmanager
-def mine_global_lock():
-    """Process-wide non-blocking lock around the full `mine` pipeline.
+def mine_palace_lock(palace_path: str):
+    """Per-palace non-blocking lock around the full `mine` pipeline.
 
     The per-file `mine_lock` only protects delete+insert interleave for a
     single source; it does not prevent N copies of `mempalace mine <dir>`
     from being spawned concurrently by hooks. When that happens, each copy
-    drives ChromaDB HNSW inserts in parallel, which (combined with
-    chromadb's multi-threaded ParallelFor) can corrupt the HNSW graph and
-    produce sparse link_lists.bin blowups.
+    drives ChromaDB HNSW inserts in parallel against the same palace,
+    which (combined with chromadb's multi-threaded ParallelFor) can
+    corrupt the HNSW graph and produce sparse link_lists.bin blowups.
 
-    This lock is non-blocking: if another `mine` is already running, we
+    The lock file is keyed by sha256(palace_path) so mines against
+    *different* palaces can still run in parallel — we only serialize
+    writes into the same palace, which is the correctness boundary.
+
+    Non-blocking: if another `mine` is already writing to this palace,
     raise MineAlreadyRunning so the caller can exit cleanly instead of
-    piling up waiting workers.
+    piling up as a waiting worker.
     """
     lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
     os.makedirs(lock_dir, exist_ok=True)
-    lock_path = os.path.join(lock_dir, "mine_global.lock")
+    resolved = os.path.abspath(os.path.expanduser(palace_path))
+    palace_key = hashlib.sha256(resolved.encode()).hexdigest()[:16]
+    lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
 
     lf = open(lock_path, "w")
     acquired = False
@@ -344,7 +350,7 @@ def mine_global_lock():
                 acquired = True
             except OSError as exc:
                 raise MineAlreadyRunning(
-                    "another `mempalace mine` is already running"
+                    f"another `mempalace mine` is already running against {resolved}"
                 ) from exc
         else:
             import fcntl
@@ -354,7 +360,7 @@ def mine_global_lock():
                 acquired = True
             except BlockingIOError as exc:
                 raise MineAlreadyRunning(
-                    "another `mempalace mine` is already running"
+                    f"another `mempalace mine` is already running against {resolved}"
                 ) from exc
         yield
     finally:
@@ -371,6 +377,12 @@ def mine_global_lock():
             except Exception:
                 pass
         lf.close()
+
+
+# Backward-compatible alias (previous patch iteration used a single global
+# lock). Kept so third-party callers that imported it continue to work; new
+# code should use `mine_palace_lock(palace_path)` for per-palace scoping.
+mine_global_lock = mine_palace_lock
 
 
 def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:

@@ -25,8 +25,8 @@ from .palace import (
     file_already_mined,
     get_closets_collection,
     get_collection,
-    mine_global_lock,
     mine_lock,
+    mine_palace_lock,
     purge_file_closets,
     upsert_closet_lines,
 )
@@ -1008,7 +1008,7 @@ def mine(
         )
 
     try:
-        with mine_global_lock():
+        with mine_palace_lock(palace_path):
             return _mine_impl(
                 project_dir,
                 palace_path,
@@ -1021,7 +1021,8 @@ def mine(
             )
     except MineAlreadyRunning:
         print(
-            "mempalace: another `mine` is already running — exiting cleanly.",
+            f"mempalace: another `mine` is already running against "
+            f"{palace_path} — exiting cleanly.",
             file=sys.stderr,
         )
         return

@@ -217,9 +217,16 @@ def _get_collection(create=False):
     try:
         client = _get_client()
         if create:
+            # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
+            # HNSW insert path, which has a race in repairConnectionsForUpdate /
+            # addPoint (see issues #974, #965). The setting is only honored at
+            # collection creation time — pre-existing palaces created before
+            # this fix keep the unsafe default; users must `mempalace nuke` +
+            # re-mine to get the protection on legacy palaces.
             _collection_cache = ChromaCollection(
                 client.get_or_create_collection(
-                    _config.collection_name, metadata={"hnsw:space": "cosine"}
+                    _config.collection_name,
+                    metadata={"hnsw:space": "cosine", "hnsw:num_threads": 1},
                 )
             )
             _metadata_cache = None
