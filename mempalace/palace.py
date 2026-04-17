@@ -329,14 +329,21 @@ def mine_palace_lock(palace_path: str):
     *different* palaces can still run in parallel — we only serialize
     writes into the same palace, which is the correctness boundary.
 
+    The key is derived from a fully normalized form of the path:
+    `realpath` resolves symlinks and `..` segments, and `normcase` folds
+    case on Windows (which has a case-insensitive filesystem). Without
+    normcase, `C:\\Palace` and `c:\\palace` would hash to different keys
+    on Windows and let two concurrent mines touch the same on-disk palace.
+
     Non-blocking: if another `mine` is already writing to this palace,
     raise MineAlreadyRunning so the caller can exit cleanly instead of
     piling up as a waiting worker.
     """
     lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
     os.makedirs(lock_dir, exist_ok=True)
-    resolved = os.path.abspath(os.path.expanduser(palace_path))
-    palace_key = hashlib.sha256(resolved.encode()).hexdigest()[:16]
+    resolved = os.path.realpath(os.path.expanduser(palace_path))
+    lock_key_source = os.path.normcase(resolved)
+    palace_key = hashlib.sha256(lock_key_source.encode()).hexdigest()[:16]
     lock_path = os.path.join(lock_dir, f"mine_palace_{palace_key}.lock")
 
     lf = open(lock_path, "w")

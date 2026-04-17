@@ -22,6 +22,18 @@ from mempalace.palace import (
 )
 
 
+def _get_mp_context():
+    """Pick a start method that works on every CI runner.
+
+    `fork` is cheaper (no re-import) but is unavailable on Windows, so we fall
+    back to `spawn` there. `spawn` inherits ``os.environ`` (including the
+    monkeypatched ``HOME``) and re-imports the ``mempalace`` package in the
+    child, which is sufficient for the lock-file semantics exercised here.
+    """
+    start_method = "spawn" if os.name == "nt" else "fork"
+    return multiprocessing.get_context(start_method)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -75,7 +87,7 @@ def test_same_palace_serializes_across_processes(tmp_path, monkeypatch):
     ready = str(tmp_path / "ready")
     release = str(tmp_path / "release")
 
-    ctx = multiprocessing.get_context("fork")
+    ctx = _get_mp_context()
     holder = ctx.Process(target=_hold_lock, args=(palace, ready, release))
     holder.start()
     try:
@@ -104,7 +116,7 @@ def test_different_palaces_dont_conflict(tmp_path, monkeypatch):
     ready = str(tmp_path / "ready_a")
     release = str(tmp_path / "release_a")
 
-    ctx = multiprocessing.get_context("fork")
+    ctx = _get_mp_context()
     holder = ctx.Process(target=_hold_lock, args=(palace_a, ready, release))
     holder.start()
     try:
