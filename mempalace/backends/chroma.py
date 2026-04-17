@@ -566,7 +566,9 @@ class ChromaBackend(BaseBackend):
 
         if create:
             collection = client.get_or_create_collection(
-                collection_name, metadata={"hnsw:space": hnsw_space}, **ef_kwargs
+                collection_name,
+                metadata={"hnsw:space": hnsw_space, "hnsw:num_threads": 1},
+                **ef_kwargs,
             )
         else:
             collection = client.get_collection(collection_name, **ef_kwargs)
@@ -613,7 +615,9 @@ class ChromaBackend(BaseBackend):
         ef = self._resolve_embedding_function()
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
         collection = self._client(palace_path).create_collection(
-            collection_name, metadata={"hnsw:space": hnsw_space}, **ef_kwargs
+            collection_name,
+            metadata={"hnsw:space": hnsw_space, "hnsw:num_threads": 1},
+            **ef_kwargs,
         )
         return ChromaCollection(collection)
 

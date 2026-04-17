@@ -643,6 +643,9 @@ def hook_session_start(data: dict, harness: str):
     _output({})
 
 
+MAX_PRECOMPACT_BLOCK_ATTEMPTS = 2
+
+
 def hook_precompact(data: dict, harness: str):
     """Precompact hook: mine transcript synchronously, then allow compaction."""
     parsed = _parse_harness_input(data, harness)

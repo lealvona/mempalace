@@ -310,6 +310,69 @@ def mine_lock(source_file: str):
         lf.close()
 
 
+class MineAlreadyRunning(RuntimeError):
+    """Raised when another `mempalace mine` process already holds the global lock."""
+
+
+@contextlib.contextmanager
+def mine_global_lock():
+    """Process-wide non-blocking lock around the full `mine` pipeline.
+
+    The per-file `mine_lock` only protects delete+insert interleave for a
+    single source; it does not prevent N copies of `mempalace mine <dir>`
+    from being spawned concurrently by hooks. When that happens, each copy
+    drives ChromaDB HNSW inserts in parallel, which (combined with
+    chromadb's multi-threaded ParallelFor) can corrupt the HNSW graph and
+    produce sparse link_lists.bin blowups.
+
+    This lock is non-blocking: if another `mine` is already running, we
+    raise MineAlreadyRunning so the caller can exit cleanly instead of
+    piling up waiting workers.
+    """
+    lock_dir = os.path.join(os.path.expanduser("~"), ".mempalace", "locks")
+    os.makedirs(lock_dir, exist_ok=True)
+    lock_path = os.path.join(lock_dir, "mine_global.lock")
+
+    lf = open(lock_path, "w")
+    acquired = False
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            try:
+                msvcrt.locking(lf.fileno(), msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except OSError as exc:
+                raise MineAlreadyRunning(
+                    "another `mempalace mine` is already running"
+                ) from exc
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except BlockingIOError as exc:
+                raise MineAlreadyRunning(
+                    "another `mempalace mine` is already running"
+                ) from exc
+        yield
+    finally:
+        if acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    msvcrt.locking(lf.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(lf, fcntl.LOCK_UN)
+            except Exception:
+                pass
+        lf.close()
+
+
 def file_already_mined(collection, source_file: str, check_mtime: bool = False) -> bool:
     """Check if a file has already been filed in the palace.
 
