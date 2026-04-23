@@ -626,6 +626,20 @@ def cmd_repair(args):
     palace_path = os.path.abspath(
         os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
     )
+
+    if getattr(args, "mode", "legacy") == "max-seq-id":
+        from .repair import repair_max_seq_id
+
+        repair_max_seq_id(
+            palace_path,
+            segment=getattr(args, "segment", None),
+            from_sidecar=getattr(args, "from_sidecar", None),
+            backup=getattr(args, "backup", True),
+            dry_run=getattr(args, "dry_run", False),
+            assume_yes=getattr(args, "yes", False),
+        )
+        return
+
     db_path = os.path.join(palace_path, "chroma.sqlite3")
 
     if not os.path.isdir(palace_path):
@@ -1118,7 +1132,10 @@ def main():
     # repair
     p_repair = sub.add_parser(
         "repair",
-        help="Rebuild palace vector index from stored data (fixes segfaults after corruption)",
+        help=(
+            "Rebuild palace vector index (legacy mode) or un-poison max_seq_id rows "
+            "(--mode max-seq-id)"
+        ),
     )
     p_repair.add_argument(
         "--yes", action="store_true", help="Skip confirmation for destructive changes"
@@ -1132,6 +1149,39 @@ def main():
             "either matches or can't be read. Use only after independently confirming "
             "the palace really contains that count."
         ),
+    )
+    p_repair.add_argument(
+        "--mode",
+        choices=["legacy", "max-seq-id"],
+        default="legacy",
+        help=(
+            "legacy: full-palace rebuild (default). "
+            "max-seq-id: un-poison max_seq_id rows corrupted by the legacy 0.6.x shim."
+        ),
+    )
+    p_repair.add_argument(
+        "--segment",
+        default=None,
+        help="Segment UUID filter for --mode max-seq-id (repairs only that segment).",
+    )
+    p_repair.add_argument(
+        "--from-sidecar",
+        default=None,
+        help=(
+            "Path to a pre-corruption chroma.sqlite3 sidecar (for --mode max-seq-id); "
+            "clean values are copied from its max_seq_id table verbatim."
+        ),
+    )
+    p_repair.add_argument(
+        "--backup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Back up SQLite before mutation (default: on)",
+    )
+    p_repair.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print detected poisoned rows and exit without mutation (--mode max-seq-id only)",
     )
 
     # repair-status — read-only HNSW capacity health check (#1222)

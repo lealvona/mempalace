@@ -517,6 +517,21 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
     the Rust compactor to crash with "mismatched types; Rust type u64 (as SQL
     type INTEGER) is not compatible with SQL type BLOB".
 
+    Scoped to the ``embeddings`` table only. The ``max_seq_id`` table used
+    to be included in this loop, but chromadb 1.5.x writes its own BLOB
+    format there (``b'\\x11\\x11'`` + 6 ASCII digits). Misinterpreting that
+    format via ``int.from_bytes(..., 'big')`` yields a ~1.23e18 integer
+    that silently suppresses every subsequent write for the affected
+    segment (``embeddings_queue`` filters on ``seq_id > start``). chromadb
+    owns the ``max_seq_id`` column — we leave it alone. Palaces already
+    poisoned by the old behaviour can be repaired via
+    ``mempalace repair --mode max-seq-id``.
+
+    Defense-in-depth: rows with the sysdb-10 ``b'\\x11\\x11'`` prefix in
+    ``embeddings`` are skipped rather than converted. Real 0.6.x BLOBs are
+    pure big-endian u64 with no text prefix, so the prefix check is a
+    no-op for genuine legacy data.
+
     Must run BEFORE PersistentClient is created (the compactor fires on init).
 
     Opening a Python sqlite3 connection against a ChromaDB 1.5.x WAL-mode
@@ -533,18 +548,24 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
         return
     try:
         with sqlite3.connect(db_path) as conn:
-            for table in ("embeddings", "max_seq_id"):
-                try:
-                    rows = conn.execute(
-                        f"SELECT rowid, seq_id FROM {table} WHERE typeof(seq_id) = 'blob'"
-                    ).fetchall()
-                except sqlite3.OperationalError:
-                    continue
-                if not rows:
-                    continue
-                updates = [(int.from_bytes(blob, byteorder="big"), rowid) for rowid, blob in rows]
-                conn.executemany(f"UPDATE {table} SET seq_id = ? WHERE rowid = ?", updates)
-                logger.info("Fixed %d BLOB seq_ids in %s", len(updates), table)
+            try:
+                rows = conn.execute(
+                    "SELECT rowid, seq_id FROM embeddings WHERE typeof(seq_id) = 'blob'"
+                ).fetchall()
+            except sqlite3.OperationalError:
+                return
+            safe_rows = [(rowid, blob) for rowid, blob in rows if not blob.startswith(b"\x11\x11")]
+            skipped = len(rows) - len(safe_rows)
+            if skipped:
+                logger.warning(
+                    "Skipped %d sysdb-10-format BLOB seq_id(s) in embeddings (not converting)",
+                    skipped,
+                )
+            if not safe_rows:
+                return
+            updates = [(int.from_bytes(blob, byteorder="big"), rowid) for rowid, blob in safe_rows]
+            conn.executemany("UPDATE embeddings SET seq_id = ? WHERE rowid = ?", updates)
+            logger.info("Fixed %d BLOB seq_ids in embeddings", len(updates))
             conn.commit()
     except Exception:
         logger.exception("Could not fix BLOB seq_ids in %s", db_path)
