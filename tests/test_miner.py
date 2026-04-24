@@ -383,6 +383,46 @@ def test_status_handles_none_metadata_without_crash(tmp_path, capsys):
     assert "WING: proj" in out
 
 
+def test_process_file_uses_bounded_upsert_batches(tmp_path, monkeypatch):
+    from mempalace import miner
+
+    class FakeCol:
+        def __init__(self):
+            self.batch_sizes = []
+
+        def get(self, *args, **kwargs):
+            return {"ids": []}
+
+        def delete(self, *args, **kwargs):
+            pass
+
+        def upsert(self, documents, ids, metadatas):
+            self.batch_sizes.append(len(documents))
+
+    source = tmp_path / "src.py"
+    source.write_text("print('hello')\n" * 20, encoding="utf-8")
+    chunks = [{"content": f"chunk {i} " * 20, "chunk_index": i} for i in range(5)]
+    col = FakeCol()
+    monkeypatch.setattr(miner, "DRAWER_UPSERT_BATCH_SIZE", 2)
+    monkeypatch.setattr(miner, "chunk_text", lambda content, source_file: chunks)
+    monkeypatch.setattr(miner, "detect_hall", lambda content: "code")
+    monkeypatch.setattr(miner, "_extract_entities_for_metadata", lambda content: "")
+
+    drawers, room = miner.process_file(
+        source,
+        tmp_path,
+        col,
+        "wing",
+        [{"name": "general", "description": "General"}],
+        "agent",
+        False,
+    )
+
+    assert drawers == 5
+    assert room == "general"
+    assert col.batch_sizes == [2, 2, 1]
+
+
 # ── normalize_version schema gate ───────────────────────────────────────
 #
 # When the normalization pipeline changes shape (e.g., strip_noise lands),

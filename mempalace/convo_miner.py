@@ -55,6 +55,7 @@ CONVO_EXTENSIONS = {
 
 MIN_CHUNK_SIZE = 30
 CHUNK_SIZE = 800  # chars per drawer — align with miner.py
+DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # Matches miner.py at 500 MB. Long Claude Code sessions, multi-year
 # ChatGPT exports, and lifetime Slack dumps routinely exceed 10 MB; the
@@ -332,44 +333,43 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         except Exception:
             pass
 
-        # Batch the whole file into one upsert so the embedding model runs
-        # a single forward pass for all chunks — dramatically faster than
-        # one call per chunk, especially on GPU where per-call overhead
-        # dominates over the actual matmul.
-        batch_docs: list = []
-        batch_ids: list = []
-        batch_metas: list = []
+        # Batch chunks into bounded upserts so large transcripts keep most of
+        # the embedding speedup without one huge Chroma/SQLite request. Keep
+        # one filed_at per source file so all transcript drawers share an
+        # ingest timestamp.
         filed_at = datetime.now().isoformat()
-        for chunk in chunks:
-            chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
-            if extract_mode == "general":
-                room_counts_delta[chunk_room] += 1
-            drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
-            batch_docs.append(chunk["content"])
-            batch_ids.append(drawer_id)
-            batch_metas.append(
-                {
-                    "wing": wing,
-                    "room": chunk_room,
-                    "hall": _detect_hall_cached(chunk["content"]),
-                    "source_file": source_file,
-                    "chunk_index": chunk["chunk_index"],
-                    "added_by": agent,
-                    "filed_at": filed_at,
-                    "ingest_mode": "convos",
-                    "extract_mode": extract_mode,
-                    "normalize_version": NORMALIZE_VERSION,
-                }
-            )
-
-        if batch_docs:
+        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+            batch_docs: list = []
+            batch_ids: list = []
+            batch_metas: list = []
+            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
+                if extract_mode == "general":
+                    room_counts_delta[chunk_room] += 1
+                drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+                batch_docs.append(chunk["content"])
+                batch_ids.append(drawer_id)
+                batch_metas.append(
+                    {
+                        "wing": wing,
+                        "room": chunk_room,
+                        "hall": _detect_hall_cached(chunk["content"]),
+                        "source_file": source_file,
+                        "chunk_index": chunk["chunk_index"],
+                        "added_by": agent,
+                        "filed_at": filed_at,
+                        "ingest_mode": "convos",
+                        "extract_mode": extract_mode,
+                        "normalize_version": NORMALIZE_VERSION,
+                    }
+                )
             try:
                 collection.upsert(
                     documents=batch_docs,
                     ids=batch_ids,
                     metadatas=batch_metas,
                 )
-                drawers_added = len(batch_docs)
+                drawers_added += len(batch_docs)
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise

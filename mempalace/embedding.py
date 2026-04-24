@@ -32,6 +32,12 @@ _PROVIDER_MAP = {
     "dml": ["DmlExecutionProvider", "CPUExecutionProvider"],
 }
 
+_DEVICE_EXTRA = {
+    "cuda": "mempalace[gpu]",
+    "coreml": "mempalace[coreml]",
+    "dml": "mempalace[dml]",
+}
+
 _AUTO_ORDER = [
     ("CUDAExecutionProvider", "cuda"),
     ("CoreMLExecutionProvider", "coreml"),
@@ -76,11 +82,13 @@ def _resolve_providers(device: str) -> tuple[list, str]:
 
     if preferred not in available:
         if device not in _WARNED:
+            extra = _DEVICE_EXTRA.get(device, "the matching mempalace extra for your device")
             logger.warning(
                 "embedding_device=%r requested but %s is not installed — "
-                "falling back to CPU. Install mempalace[gpu] for CUDA.",
+                "falling back to CPU. Install %s.",
                 device,
                 preferred,
+                extra,
             )
             _WARNED.add(device)
         return (["CPUExecutionProvider"], "cpu")

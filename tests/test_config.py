@@ -20,6 +20,32 @@ def test_config_from_file():
     assert cfg.palace_path == "/custom/palace"
 
 
+def test_embedding_device_defaults_to_auto():
+    cfg = MempalaceConfig(config_dir=tempfile.mkdtemp())
+    assert cfg.embedding_device == "auto"
+
+
+def test_embedding_device_from_config_is_normalized():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"embedding_device": "  CUDA  "}, f)
+
+    cfg = MempalaceConfig(config_dir=tmpdir)
+    assert cfg.embedding_device == "cuda"
+
+
+def test_embedding_device_env_overrides_config():
+    tmpdir = tempfile.mkdtemp()
+    with open(os.path.join(tmpdir, "config.json"), "w") as f:
+        json.dump({"embedding_device": "cpu"}, f)
+    os.environ["MEMPALACE_EMBEDDING_DEVICE"] = "  CoreML  "
+    try:
+        cfg = MempalaceConfig(config_dir=tmpdir)
+        assert cfg.embedding_device == "coreml"
+    finally:
+        del os.environ["MEMPALACE_EMBEDDING_DEVICE"]
+
+
 def test_env_override():
     raw = "/env/palace"
     os.environ["MEMPALACE_PALACE_PATH"] = raw

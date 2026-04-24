@@ -65,6 +65,7 @@ SKIP_FILENAMES = {
 CHUNK_SIZE = 800  # chars per drawer
 CHUNK_OVERLAP = 100  # overlap between chunks
 MIN_CHUNK_SIZE = 50  # skip tiny chunks
+DRAWER_UPSERT_BATCH_SIZE = 1000
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500 MB — skip files larger than this.
 # Long Claude Code sessions and large transcript exports routinely exceed
 # 10 MB. The cap exists as a defensive rail against pathological binary
@@ -748,42 +749,41 @@ def process_file(
         except Exception:
             pass
 
-        # Batch all chunks of this file into a single upsert so the embedding
-        # model runs one forward pass over the whole file instead of N passes
-        # of one chunk each. On CPU this is typically a 10-30x speedup; on
-        # GPU the speedup is larger because per-call overhead dominates.
+        # Batch chunks into bounded upserts so the embedding model sees many
+        # chunks per forward pass without building one huge Chroma/SQLite
+        # request for pathological files. A bad chunk can fail its sub-batch;
+        # that is the deliberate trade-off for amortizing embedding overhead.
         try:
             source_mtime = os.path.getmtime(source_file)
         except OSError:
             source_mtime = None
 
-        batch_docs: list = []
-        batch_ids: list = []
-        batch_metas: list = []
-        for chunk in chunks:
-            drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
-            batch_docs.append(chunk["content"])
-            batch_ids.append(drawer_id)
-            batch_metas.append(
-                _build_drawer_metadata(
-                    wing,
-                    room,
-                    source_file,
-                    chunk["chunk_index"],
-                    agent,
-                    chunk["content"],
-                    source_mtime,
-                )
-            )
-
         drawers_added = 0
-        if batch_docs:
+        for batch_start in range(0, len(chunks), DRAWER_UPSERT_BATCH_SIZE):
+            batch_docs: list = []
+            batch_ids: list = []
+            batch_metas: list = []
+            for chunk in chunks[batch_start : batch_start + DRAWER_UPSERT_BATCH_SIZE]:
+                drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+                batch_docs.append(chunk["content"])
+                batch_ids.append(drawer_id)
+                batch_metas.append(
+                    _build_drawer_metadata(
+                        wing,
+                        room,
+                        source_file,
+                        chunk["chunk_index"],
+                        agent,
+                        chunk["content"],
+                        source_mtime,
+                    )
+                )
             collection.upsert(
                 documents=batch_docs,
                 ids=batch_ids,
                 metadatas=batch_metas,
             )
-            drawers_added = len(batch_docs)
+            drawers_added += len(batch_docs)
 
         # Build closet — the searchable index pointing to these drawers.
         # Purge first: a re-mine (mtime change or normalize_version bump) must
