@@ -496,3 +496,104 @@ def test_add_drawer_stamps_normalize_version(tmp_path):
         assert meta["normalize_version"] == NORMALIZE_VERSION
     finally:
         del col, client
+
+
+def test_mine_creates_topic_tunnels_for_shared_topics(tmp_path, monkeypatch):
+    """End-to-end: when two wings have already-confirmed topics that overlap,
+    the miner's mine-time pass drops a cross-wing tunnel between them.
+
+    Issue #1180.
+    """
+    from mempalace import miner, palace_graph
+
+    # Redirect both the registry and tunnel-storage paths into tmp_path
+    # so we never touch the developer's real ~/.mempalace directory.
+    registry = tmp_path / "known_entities.json"
+    monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
+    miner._ENTITY_REGISTRY_CACHE.update({"mtime": None, "names": frozenset(), "raw": {}})
+    tunnels_file = tmp_path / "tunnels.json"
+    monkeypatch.setattr(palace_graph, "_TUNNEL_FILE", str(tunnels_file))
+
+    # Pre-populate the registry as if init had been run for two wings that
+    # share a topic.
+    miner.add_to_known_entities({"topics": ["foo", "bar"]}, wing="wing_one")
+    miner.add_to_known_entities({"topics": ["foo", "baz"]}, wing="wing_two")
+
+    # Mine wing_two — should drop tunnels between wing_two and wing_one
+    # for every shared topic. Just one in this case.
+    project_root = tmp_path / "wing_two_project"
+    project_root.mkdir()
+    write_file(
+        project_root / "notes.md",
+        "Some prose long enough to make a chunk. " * 20,
+    )
+    with open(project_root / "mempalace.yaml", "w") as f:
+        yaml.dump({"wing": "wing_two", "rooms": [{"name": "general"}]}, f)
+
+    palace_path = tmp_path / "palace"
+    mine(str(project_root), str(palace_path))
+
+    listed = palace_graph.list_tunnels()
+    assert len(listed) == 1
+    rooms = {listed[0]["source"]["room"], listed[0]["target"]["room"]}
+    assert rooms == {"foo"}
+    wings = {listed[0]["source"]["wing"], listed[0]["target"]["wing"]}
+    assert wings == {"wing_one", "wing_two"}
+
+
+def test_mine_no_tunnel_when_threshold_blocks_overlap(tmp_path, monkeypatch):
+    """Bumping ``MEMPALACE_TOPIC_TUNNEL_MIN_COUNT`` above the actual overlap
+    suppresses tunnel creation."""
+    from mempalace import miner, palace_graph
+
+    registry = tmp_path / "known_entities.json"
+    monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
+    miner._ENTITY_REGISTRY_CACHE.update({"mtime": None, "names": frozenset(), "raw": {}})
+    tunnels_file = tmp_path / "tunnels.json"
+    monkeypatch.setattr(palace_graph, "_TUNNEL_FILE", str(tunnels_file))
+    monkeypatch.setenv("MEMPALACE_TOPIC_TUNNEL_MIN_COUNT", "2")
+
+    miner.add_to_known_entities({"topics": ["foo"]}, wing="wing_one")
+    miner.add_to_known_entities({"topics": ["foo"]}, wing="wing_two")
+
+    project_root = tmp_path / "wing_two_project"
+    project_root.mkdir()
+    write_file(
+        project_root / "notes.md",
+        "Some prose long enough to make a chunk. " * 20,
+    )
+    with open(project_root / "mempalace.yaml", "w") as f:
+        yaml.dump({"wing": "wing_two", "rooms": [{"name": "general"}]}, f)
+
+    palace_path = tmp_path / "palace"
+    mine(str(project_root), str(palace_path))
+
+    # min_count=2 but only 1 shared topic → no tunnel.
+    assert palace_graph.list_tunnels() == []
+
+
+def test_mine_no_tunnel_when_only_one_wing_has_topics(tmp_path, monkeypatch):
+    """A wing in isolation (no other wing has confirmed topics) creates no tunnels."""
+    from mempalace import miner, palace_graph
+
+    registry = tmp_path / "known_entities.json"
+    monkeypatch.setattr(miner, "_ENTITY_REGISTRY_PATH", str(registry))
+    miner._ENTITY_REGISTRY_CACHE.update({"mtime": None, "names": frozenset(), "raw": {}})
+    tunnels_file = tmp_path / "tunnels.json"
+    monkeypatch.setattr(palace_graph, "_TUNNEL_FILE", str(tunnels_file))
+
+    miner.add_to_known_entities({"topics": ["foo"]}, wing="wing_one")
+
+    project_root = tmp_path / "wing_one_project"
+    project_root.mkdir()
+    write_file(
+        project_root / "notes.md",
+        "Some prose long enough to make a chunk. " * 20,
+    )
+    with open(project_root / "mempalace.yaml", "w") as f:
+        yaml.dump({"wing": "wing_one", "rooms": [{"name": "general"}]}, f)
+
+    palace_path = tmp_path / "palace"
+    mine(str(project_root), str(palace_path))
+
+    assert palace_graph.list_tunnels() == []

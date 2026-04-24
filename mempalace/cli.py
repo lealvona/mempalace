@@ -117,21 +117,34 @@ def cmd_init(args):
     if languages_tuple != ("en",):
         print(f"  Languages: {', '.join(languages_tuple)}")
     detected = discover_entities(args.dir, languages=languages_tuple, llm_provider=llm_provider)
-    total = len(detected["people"]) + len(detected["projects"]) + len(detected["uncertain"])
+    total = (
+        len(detected["people"])
+        + len(detected["projects"])
+        + len(detected.get("topics", []))
+        + len(detected["uncertain"])
+    )
     if total > 0:
         confirmed = confirm_entities(detected, yes=getattr(args, "yes", False))
         # Save confirmed entities to <project>/entities.json (per-project
         # audit trail — user can inspect or hand-edit) AND merge into the
-        # global registry the miner reads at mine time.
-        if confirmed["people"] or confirmed["projects"]:
-            entities_path = Path(args.dir).expanduser().resolve() / "entities.json"
+        # global registry the miner reads at mine time. Topics are kept
+        # separately so the miner can later compute cross-wing tunnels
+        # from shared topics (see palace_graph.compute_topic_tunnels).
+        if confirmed["people"] or confirmed["projects"] or confirmed.get("topics"):
+            project_path = Path(args.dir).expanduser().resolve()
+            entities_path = project_path / "entities.json"
             with open(entities_path, "w", encoding="utf-8") as f:
                 json.dump(confirmed, f, indent=2, ensure_ascii=False)
             print(f"  Entities saved: {entities_path}")
 
             from .miner import add_to_known_entities
 
-            registry_path = add_to_known_entities(confirmed)
+            # Wing matches the default produced by ``room_detector_local``
+            # (folder basename) and the miner fallback in ``load_config``.
+            # Used by the topics_by_wing map so cross-wing tunnels can be
+            # computed at mine time.
+            wing = project_path.name
+            registry_path = add_to_known_entities(confirmed, wing=wing)
             print(f"  Registry updated: {registry_path}")
     else:
         print("  No entities detected — proceeding with directory-based rooms.")

@@ -439,7 +439,16 @@ def _refresh_known_entities_cache() -> None:
             data = json.load(f)
         if isinstance(data, dict):
             raw = data
-            for cat in data.values():
+            for cat_key, cat in data.items():
+                # Special wing-keyed map — its inner values are topic
+                # names but its outer keys are wings, which must NOT be
+                # surfaced as known entities. Pull the topic names out
+                # explicitly instead of treating it as a generic category.
+                if cat_key == "topics_by_wing" and isinstance(cat, dict):
+                    for topic_list in cat.values():
+                        if isinstance(topic_list, list):
+                            names.update(str(n) for n in topic_list if n)
+                    continue
                 if isinstance(cat, list):
                     names.update(str(n) for n in cat if n)
                 elif isinstance(cat, dict):
@@ -474,7 +483,39 @@ def _load_known_entities_raw() -> dict:
     return dict(_ENTITY_REGISTRY_CACHE["raw"])
 
 
-def add_to_known_entities(entities_by_category: dict) -> str:
+def _set_wing_topics(existing: dict, wing_key: str, topics_for_wing: list, coerce) -> None:
+    """Update ``existing['topics_by_wing'][wing_key]`` to the deduped list.
+
+    Replaces (does not union) the wing's topic list — re-running ``init``
+    should reflect the user's latest confirmation rather than accumulate
+    stale labels. Empty input drops the wing entry; an empty map drops
+    the ``topics_by_wing`` key entirely.
+    """
+    topics_map = existing.get("topics_by_wing")
+    if not isinstance(topics_map, dict):
+        topics_map = {}
+    seen_lower: set = set()
+    ordered: list = []
+    for n in topics_for_wing:
+        name = coerce(n)
+        if not name:
+            continue
+        key = name.lower()
+        if key in seen_lower:
+            continue
+        seen_lower.add(key)
+        ordered.append(name)
+    if ordered:
+        topics_map[wing_key] = ordered
+    else:
+        topics_map.pop(wing_key, None)
+    if topics_map:
+        existing["topics_by_wing"] = topics_map
+    else:
+        existing.pop("topics_by_wing", None)
+
+
+def add_to_known_entities(entities_by_category: dict, wing: str = None) -> str:
     """Union ``entities_by_category`` into ``~/.mempalace/known_entities.json``.
 
     Accepts ``{category: [names]}`` shape as produced by ``mempalace init``
@@ -487,6 +528,15 @@ def add_to_known_entities(entities_by_category: dict) -> str:
     miner-supported shape, used by dialect-style configs), new names are
     added as keys with ``None`` values so existing code mappings aren't
     overwritten. A later compress pass can assign codes.
+
+    When ``wing`` is provided AND ``entities_by_category`` contains a
+    ``topics`` list, those topics are also recorded under
+    ``topics_by_wing[wing]`` (case-insensitive dedup, preserving the
+    casing of the first observed name). This is the signal source for
+    ``palace_graph.compute_topic_tunnels`` at mine time. Topics for a
+    wing are *replaced*, not unioned, so a re-run of ``init`` reflects
+    the user's latest confirmation rather than accumulating stale labels
+    indefinitely.
 
     The in-process cache is invalidated on write so same-process callers
     (notably ``cmd_init`` → ``cmd_mine`` in sequence) see the update
@@ -515,7 +565,16 @@ def add_to_known_entities(entities_by_category: dict) -> str:
         name = str(value)
         return name if name else None
 
+    # Separate the topics_by_wing key from regular categories so we don't
+    # treat it as a flat name-list elsewhere in this function.
+    topics_for_wing = None
+    if wing and isinstance(wing, str) and wing.strip():
+        topics_for_wing = entities_by_category.get("topics") or []
+
     for category, names in entities_by_category.items():
+        if category == "topics_by_wing":
+            # Reserved key — managed separately below.
+            continue
         if not isinstance(names, list) or not names:
             continue
         current = existing.get(category)
@@ -551,6 +610,9 @@ def add_to_known_entities(entities_by_category: dict) -> str:
                 ordered.append(name)
             existing[category] = ordered
 
+    if topics_for_wing is not None:
+        _set_wing_topics(existing, wing.strip(), topics_for_wing, _coerce_name)
+
     registry_path.write_text(_json.dumps(existing, indent=2, ensure_ascii=False), encoding="utf-8")
     try:
         registry_path.chmod(0o600)
@@ -563,6 +625,28 @@ def add_to_known_entities(entities_by_category: dict) -> str:
     _ENTITY_REGISTRY_CACHE["raw"] = {}
 
     return str(registry_path)
+
+
+def get_topics_by_wing() -> dict:
+    """Return ``topics_by_wing`` from the global registry as a dict.
+
+    Returns ``{}`` if the registry is missing, malformed, or has no
+    ``topics_by_wing`` key. Casing is preserved from disk; callers that
+    need case-insensitive comparison should normalize themselves.
+    """
+    raw = _load_known_entities_raw()
+    topics_map = raw.get("topics_by_wing")
+    if not isinstance(topics_map, dict):
+        return {}
+    out: dict = {}
+    for wing, topics in topics_map.items():
+        if not isinstance(wing, str) or not wing.strip():
+            continue
+        if isinstance(topics, list):
+            cleaned = [str(t) for t in topics if isinstance(t, str) and t.strip()]
+            if cleaned:
+                out[wing.strip()] = cleaned
+    return out
 
 
 _HALL_KEYWORDS_CACHE = None
@@ -962,6 +1046,19 @@ def mine(
             if not dry_run:
                 print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
 
+    if not dry_run:
+        # Cross-wing topic tunnels: after every file in this wing has been
+        # processed, link this wing to any other wing that shares a
+        # confirmed TOPIC label. Out of scope for v1: manifest-dependency
+        # overlap, per-topic allow/deny lists, search-result surfacing.
+        try:
+            tunnels_added = _compute_topic_tunnels_for_wing(wing)
+            if tunnels_added:
+                print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
+        except Exception as e:
+            # Tunnel computation must never fail a mine — degrade quietly.
+            print(f"\n  WARNING: topic tunnel computation skipped — {e}", file=sys.stderr)
+
     print(f"\n{'=' * 55}")
     print("  Done.")
     print(f"  Files processed: {len(files) - files_skipped}")
@@ -972,6 +1069,25 @@ def mine(
         print(f"    {room:20} {count} files")
     print('\n  Next: mempalace search "what you\'re looking for"')
     print(f"{'=' * 55}\n")
+
+
+def _compute_topic_tunnels_for_wing(wing: str) -> int:
+    """Drop tunnels between ``wing`` and every other wing that shares
+    confirmed topics, honoring the ``topic_tunnel_min_count`` config knob.
+
+    Returns the number of tunnels created or refreshed. Zero means no
+    overlap found (or the registry has no ``topics_by_wing`` map yet).
+    """
+    from .config import MempalaceConfig
+    from .palace_graph import topic_tunnels_for_wing
+
+    topics_map = get_topics_by_wing()
+    if not topics_map or wing not in topics_map:
+        return 0
+    cfg = MempalaceConfig()
+    min_count = cfg.topic_tunnel_min_count
+    created = topic_tunnels_for_wing(wing, topics_map, min_count=min_count)
+    return len(created)
 
 
 # =============================================================================

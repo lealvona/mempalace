@@ -135,3 +135,126 @@ class TestExplicitTunnels:
         connections = palace_graph.follow_tunnels("wing_code", "auth", col=col)
         assert len(connections) == 1
         assert "drawer_preview" not in connections[0]
+
+
+class TestTopicTunnels:
+    """Cross-wing topic tunnels (issue #1180).
+
+    When two wings share confirmed TOPIC labels above a configurable
+    threshold, a symmetric tunnel is created between them. Tunnels are
+    routed through the existing ``create_tunnel`` storage so they share
+    dedup and persistence with explicit tunnels.
+    """
+
+    def test_compute_topic_tunnels_creates_link_for_shared_topic(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        topics_by_wing = {
+            "wing_alpha": ["Angular", "OpenAPI"],
+            "wing_beta": ["OpenAPI", "Kubernetes"],
+        }
+        created = palace_graph.compute_topic_tunnels(topics_by_wing, min_count=1)
+        assert len(created) == 1
+        assert created[0]["source"]["wing"] in {"wing_alpha", "wing_beta"}
+        assert created[0]["target"]["wing"] in {"wing_alpha", "wing_beta"}
+        # Room is the topic itself (case preserved from the first wing).
+        assert created[0]["source"]["room"] == "OpenAPI"
+        assert "OpenAPI" in created[0]["label"]
+
+        # Tunnel is retrievable via the standard list_tunnels API.
+        listed = palace_graph.list_tunnels()
+        assert len(listed) == 1
+        assert listed[0]["id"] == created[0]["id"]
+
+    def test_compute_topic_tunnels_no_link_below_threshold(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        topics_by_wing = {
+            "wing_alpha": ["Angular", "OpenAPI"],
+            "wing_beta": ["OpenAPI", "Kubernetes"],
+        }
+        # min_count=2 requires two overlapping topics — only one shared.
+        created = palace_graph.compute_topic_tunnels(topics_by_wing, min_count=2)
+        assert created == []
+        assert palace_graph.list_tunnels() == []
+
+    def test_compute_topic_tunnels_above_threshold_creates_per_topic_links(
+        self, tmp_path, monkeypatch
+    ):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        topics_by_wing = {
+            "wing_alpha": ["Angular", "OpenAPI", "Postgres"],
+            "wing_beta": ["Angular", "OpenAPI", "Redis"],
+        }
+        created = palace_graph.compute_topic_tunnels(topics_by_wing, min_count=2)
+        # Two shared topics × one wing pair = two tunnels.
+        rooms = sorted(t["source"]["room"] for t in created)
+        assert rooms == ["Angular", "OpenAPI"]
+
+    def test_compute_topic_tunnels_case_insensitive_overlap(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        topics_by_wing = {
+            "wing_alpha": ["openapi"],
+            "wing_beta": ["OpenAPI"],
+        }
+        created = palace_graph.compute_topic_tunnels(topics_by_wing, min_count=1)
+        assert len(created) == 1
+
+    def test_compute_topic_tunnels_empty_input_is_noop(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        assert palace_graph.compute_topic_tunnels({}) == []
+        assert palace_graph.compute_topic_tunnels({"wing_a": []}) == []
+        assert palace_graph.list_tunnels() == []
+
+    def test_compute_topic_tunnels_three_wings_pairwise(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        topics_by_wing = {
+            "wing_a": ["foo"],
+            "wing_b": ["foo"],
+            "wing_c": ["foo"],
+        }
+        created = palace_graph.compute_topic_tunnels(topics_by_wing, min_count=1)
+        # 3 wings sharing the same topic → C(3,2) = 3 pairs → 3 tunnels.
+        assert len(created) == 3
+        endpoint_pairs = {
+            tuple(sorted([t["source"]["wing"], t["target"]["wing"]])) for t in created
+        }
+        assert endpoint_pairs == {
+            ("wing_a", "wing_b"),
+            ("wing_a", "wing_c"),
+            ("wing_b", "wing_c"),
+        }
+
+    def test_topic_tunnels_for_wing_only_links_that_wing(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        topics_by_wing = {
+            "wing_a": ["foo", "bar"],
+            "wing_b": ["foo"],
+            "wing_c": ["bar"],
+        }
+        # wing_a should link to both b (via foo) and c (via bar).
+        created = palace_graph.topic_tunnels_for_wing("wing_a", topics_by_wing)
+        endpoint_pairs = {
+            tuple(sorted([t["source"]["wing"], t["target"]["wing"]])) for t in created
+        }
+        assert endpoint_pairs == {("wing_a", "wing_b"), ("wing_a", "wing_c")}
+        # The b-c pair is NOT created because wing_a's incremental pass
+        # only computes pairs that include wing_a.
+        assert len(palace_graph.list_tunnels()) == 2
+
+    def test_topic_tunnels_for_wing_unknown_wing_is_noop(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        topics_by_wing = {"wing_a": ["foo"], "wing_b": ["foo"]}
+        assert palace_graph.topic_tunnels_for_wing("wing_missing", topics_by_wing) == []
+        assert palace_graph.list_tunnels() == []
+
+    def test_compute_topic_tunnels_dedupe_on_recompute(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        topics_by_wing = {
+            "wing_alpha": ["OpenAPI"],
+            "wing_beta": ["OpenAPI"],
+        }
+        first = palace_graph.compute_topic_tunnels(topics_by_wing, min_count=1)
+        second = palace_graph.compute_topic_tunnels(topics_by_wing, min_count=1)
+        # create_tunnel is symmetric/dedupe — repeated computation should
+        # not multiply the stored tunnels.
+        assert first[0]["id"] == second[0]["id"]
+        assert len(palace_graph.list_tunnels()) == 1

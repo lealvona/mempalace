@@ -254,6 +254,32 @@ class MempalaceConfig:
         return str(self._file_config.get("embedding_device", "auto")).strip().lower()
 
     @property
+    def topic_tunnel_min_count(self):
+        """Minimum number of overlapping confirmed topics required to create
+        a cross-wing tunnel between two wings.
+
+        Default is ``1`` — any single shared topic produces a tunnel. Bump
+        to ``2+`` if your projects share lots of common-tech labels (Python,
+        Docker, Git) and you want only meaningfully overlapping wings to
+        link. Reads ``MEMPALACE_TOPIC_TUNNEL_MIN_COUNT`` env first, then the
+        config-file value, then ``1``.
+        """
+        env_val = os.environ.get("MEMPALACE_TOPIC_TUNNEL_MIN_COUNT")
+        if env_val:
+            try:
+                parsed = int(env_val)
+                if parsed >= 1:
+                    return parsed
+            except ValueError:
+                pass
+        cfg_val = self._file_config.get("topic_tunnel_min_count")
+        try:
+            parsed = int(cfg_val) if cfg_val is not None else 1
+        except (TypeError, ValueError):
+            parsed = 1
+        return max(1, parsed)
+
+    @property
     def hook_silent_save(self):
         """Whether the stop hook saves directly (True) or blocks for MCP calls (False)."""
         return self._file_config.get("hooks", {}).get("silent_save", True)
