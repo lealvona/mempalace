@@ -368,6 +368,18 @@ class ChromaCollection(BaseCollection):
     def count(self):
         return self._collection.count()
 
+    @property
+    def metadata(self) -> dict:
+        """Pass-through to the underlying ChromaDB collection's metadata.
+
+        Used by the searcher to detect legacy palaces that were created
+        without ``hnsw:space=cosine`` and therefore silently use L2
+        distance, which breaks cosine-based similarity interpretation.
+        Returns ``{}`` when metadata is absent so callers can do a plain
+        ``.get("hnsw:space")`` without None-checks.
+        """
+        return self._collection.metadata or {}
+
 
 # ---------------------------------------------------------------------------
 # Backend
