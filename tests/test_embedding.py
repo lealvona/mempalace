@@ -1,5 +1,3 @@
-import builtins
-
 import pytest
 
 import mempalace.embedding as embedding
@@ -62,6 +60,8 @@ def test_unknown_device_warns_once(monkeypatch, caplog):
 
 
 def test_onnxruntime_import_error_falls_back_to_cpu(monkeypatch):
+    import builtins
+
     real_import = builtins.__import__
 
     def fake_import(name, *args, **kwargs):

@@ -1,5 +1,7 @@
 """Unit tests for convo_miner pure functions (no chromadb needed)."""
 
+import contextlib
+
 from mempalace.convo_miner import (
     _file_chunks_locked,
     chunk_exchanges,
@@ -116,8 +118,6 @@ class TestScanConvos:
 
 class TestFileChunksLocked:
     def test_uses_bounded_upsert_batches(self, monkeypatch):
-        import contextlib
-
         import mempalace.convo_miner as convo_miner
 
         class FakeCol:
