@@ -108,6 +108,7 @@ def test_cmd_init_no_entities(mock_config_cls, tmp_path):
     with (
         patch("mempalace.entity_detector.scan_for_detection", return_value=[]),
         patch("mempalace.room_detector_local.detect_rooms_local") as mock_rooms,
+        patch("mempalace.cli._maybe_run_mine_after_init"),
     ):
         cmd_init(args)
         mock_rooms.assert_called_once_with(project_dir=str(tmp_path), yes=True)
@@ -126,6 +127,7 @@ def test_cmd_init_with_entities(mock_config_cls, tmp_path):
         patch("mempalace.entity_detector.confirm_entities", return_value=confirmed),
         patch("mempalace.room_detector_local.detect_rooms_local"),
         patch("builtins.open", MagicMock()),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
     ):
         cmd_init(args)
 
@@ -140,10 +142,120 @@ def test_cmd_init_with_entities_zero_total(mock_config_cls, tmp_path, capsys):
         patch("mempalace.entity_detector.scan_for_detection", return_value=fake_files),
         patch("mempalace.entity_detector.detect_entities", return_value=detected),
         patch("mempalace.room_detector_local.detect_rooms_local"),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
     ):
         cmd_init(args)
     out = capsys.readouterr().out
     assert "No entities detected" in out
+
+
+# ── _maybe_run_mine_after_init (init → mine prompt, #1181) ─────────────
+
+
+def _init_args(tmp_path, *, yes=False):
+    return argparse.Namespace(dir=str(tmp_path), yes=yes)
+
+
+def _fake_cfg(tmp_path):
+    cfg = MagicMock()
+    cfg.palace_path = str(tmp_path / "palace")
+    return cfg
+
+
+def test_maybe_run_mine_prompt_accepted_runs_mine(tmp_path):
+    """Empty / 'y' / 'yes' on the prompt triggers mine() in-process."""
+    from mempalace.cli import _maybe_run_mine_after_init
+
+    args = _init_args(tmp_path, yes=False)
+    cfg = _fake_cfg(tmp_path)
+    with (
+        patch("mempalace.miner.mine") as mock_mine,
+        patch("mempalace.miner.scan_project", return_value=["a", "b", "c"]),
+        patch("builtins.input", return_value=""),
+    ):
+        _maybe_run_mine_after_init(args, cfg)
+        mock_mine.assert_called_once_with(project_dir=str(tmp_path), palace_path=cfg.palace_path)
+
+
+def test_maybe_run_mine_prompt_yes_accepted_runs_mine(tmp_path):
+    """Explicit 'y' answer also runs mine()."""
+    from mempalace.cli import _maybe_run_mine_after_init
+
+    args = _init_args(tmp_path, yes=False)
+    cfg = _fake_cfg(tmp_path)
+    with (
+        patch("mempalace.miner.mine") as mock_mine,
+        patch("mempalace.miner.scan_project", return_value=[]),
+        patch("builtins.input", return_value="Y"),
+    ):
+        _maybe_run_mine_after_init(args, cfg)
+        mock_mine.assert_called_once()
+
+
+def test_maybe_run_mine_prompt_declined_prints_hint(tmp_path, capsys):
+    """'n' answer skips mine() and prints the resume hint."""
+    from mempalace.cli import _maybe_run_mine_after_init
+
+    args = _init_args(tmp_path, yes=False)
+    cfg = _fake_cfg(tmp_path)
+    with (
+        patch("mempalace.miner.mine") as mock_mine,
+        patch("mempalace.miner.scan_project", return_value=[]),
+        patch("builtins.input", return_value="n"),
+    ):
+        _maybe_run_mine_after_init(args, cfg)
+        mock_mine.assert_not_called()
+    out = capsys.readouterr().out
+    assert f"mempalace mine {tmp_path}" in out
+    assert "Skipped" in out
+
+
+def test_maybe_run_mine_yes_flag_skips_prompt_and_mines(tmp_path):
+    """`--yes` runs mine() automatically without calling input()."""
+    from mempalace.cli import _maybe_run_mine_after_init
+
+    args = _init_args(tmp_path, yes=True)
+    cfg = _fake_cfg(tmp_path)
+    with (
+        patch("mempalace.miner.mine") as mock_mine,
+        patch("mempalace.miner.scan_project", return_value=[]),
+        patch("builtins.input", side_effect=AssertionError("input() must not be called")),
+    ):
+        _maybe_run_mine_after_init(args, cfg)
+        mock_mine.assert_called_once_with(project_dir=str(tmp_path), palace_path=cfg.palace_path)
+
+
+def test_maybe_run_mine_eof_on_stdin_treated_as_decline(tmp_path, capsys):
+    """Piped / non-interactive stdin (EOFError) declines without crashing."""
+    from mempalace.cli import _maybe_run_mine_after_init
+
+    args = _init_args(tmp_path, yes=False)
+    cfg = _fake_cfg(tmp_path)
+    with (
+        patch("mempalace.miner.mine") as mock_mine,
+        patch("mempalace.miner.scan_project", return_value=[]),
+        patch("builtins.input", side_effect=EOFError),
+    ):
+        _maybe_run_mine_after_init(args, cfg)
+        mock_mine.assert_not_called()
+    assert "Skipped" in capsys.readouterr().out
+
+
+def test_maybe_run_mine_failure_surfaces_via_exit(tmp_path, capsys):
+    """Mine errors are not swallowed — they exit non-zero with an error line."""
+    from mempalace.cli import _maybe_run_mine_after_init
+
+    args = _init_args(tmp_path, yes=True)
+    cfg = _fake_cfg(tmp_path)
+    with (
+        patch("mempalace.miner.mine", side_effect=RuntimeError("boom")),
+        patch("mempalace.miner.scan_project", return_value=[]),
+    ):
+        with pytest.raises(SystemExit) as exc_info:
+            _maybe_run_mine_after_init(args, cfg)
+    assert exc_info.value.code == 1
+    err = capsys.readouterr().err
+    assert "boom" in err
 
 
 # ── cmd_mine ───────────────────────────────────────────────────────────

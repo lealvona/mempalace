@@ -600,3 +600,118 @@ def test_mine_no_tunnel_when_only_one_wing_has_topics(tmp_path, monkeypatch):
     mine(str(project_root), str(palace_path))
 
     assert palace_graph.list_tunnels() == []
+
+
+# ── graceful Ctrl-C handling (#1182) ────────────────────────────────────
+
+
+def _make_minable_project(project_root: Path, n_files: int = 3) -> None:
+    """Create a tiny project with N readable files + a config so mine() runs."""
+    for idx in range(n_files):
+        write_file(
+            project_root / f"f{idx}.py",
+            f"def fn_{idx}():\n    print('hi {idx}')\n" * 20,
+        )
+    with open(project_root / "mempalace.yaml", "w") as f:
+        yaml.dump(
+            {
+                "wing": "interrupt_test",
+                "rooms": [{"name": "general", "description": "General"}],
+            },
+            f,
+        )
+
+
+def test_mine_keyboard_interrupt_prints_summary_and_exits_130(tmp_path, capsys):
+    """A KeyboardInterrupt mid-loop produces the clean summary + exit 130."""
+    import pytest
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=4)
+    palace_path = project_root / "palace"
+
+    call_count = {"n": 0}
+
+    def fake_process_file(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            raise KeyboardInterrupt
+        return (1, "general")
+
+    with patch("mempalace.miner.process_file", side_effect=fake_process_file):
+        with pytest.raises(SystemExit) as exc_info:
+            mine(str(project_root), str(palace_path))
+
+    assert exc_info.value.code == 130
+    out = capsys.readouterr().out
+    assert "Mine interrupted." in out
+    assert "files_processed: 1/" in out
+    assert "drawers_filed:" in out
+    assert "last_file:" in out
+    assert "upserted idempotently" in out
+
+
+def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
+    """Our own PID entry in mine.pid is removed in the finally clause."""
+    import pytest
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=2)
+    palace_path = project_root / "palace"
+
+    pid_file = tmp_path / "mine.pid"
+    pid_file.write_text(str(os.getpid()))
+
+    def fake_process_file(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    with (
+        patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file),
+        patch("mempalace.miner.process_file", side_effect=fake_process_file),
+    ):
+        with pytest.raises(SystemExit):
+            mine(str(project_root), str(palace_path))
+
+    assert not pid_file.exists(), "Our PID entry should be cleaned up on interrupt"
+
+
+def test_mine_cleans_up_pid_file_on_clean_exit(tmp_path):
+    """Successful mine also removes its own PID entry in the finally clause."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=1)
+    palace_path = project_root / "palace"
+
+    pid_file = tmp_path / "mine.pid"
+    pid_file.write_text(str(os.getpid()))
+
+    with patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file):
+        mine(str(project_root), str(palace_path))
+
+    assert not pid_file.exists()
+
+
+def test_mine_does_not_remove_other_processes_pid_file(tmp_path):
+    """A PID file pointing at someone else's PID is left untouched."""
+    from unittest.mock import patch
+
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    _make_minable_project(project_root, n_files=1)
+    palace_path = project_root / "palace"
+
+    other_pid = os.getpid() + 999_999  # a PID that isn't us
+    pid_file = tmp_path / "mine.pid"
+    pid_file.write_text(str(other_pid))
+
+    with patch("mempalace.hooks_cli._MINE_PID_FILE", pid_file):
+        mine(str(project_root), str(palace_path))
+
+    assert pid_file.exists(), "Foreign PID entries must not be removed"
+    assert pid_file.read_text().strip() == str(other_pid)

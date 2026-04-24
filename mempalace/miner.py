@@ -1025,50 +1025,117 @@ def mine(
 
     total_drawers = 0
     files_skipped = 0
+    files_processed = 0
+    last_file = None
     room_counts = defaultdict(int)
 
-    for i, filepath in enumerate(files, 1):
-        drawers, room = process_file(
-            filepath=filepath,
-            project_path=project_path,
-            collection=collection,
-            wing=wing,
-            rooms=rooms,
-            agent=agent,
-            dry_run=dry_run,
-            closets_col=closets_col,
+    try:
+        for i, filepath in enumerate(files, 1):
+            try:
+                drawers, room = process_file(
+                    filepath=filepath,
+                    project_path=project_path,
+                    collection=collection,
+                    wing=wing,
+                    rooms=rooms,
+                    agent=agent,
+                    dry_run=dry_run,
+                    closets_col=closets_col,
+                )
+            except KeyboardInterrupt:
+                # Re-raise so the outer handler prints the summary; we
+                # capture the last-attempted file via last_file below.
+                last_file = filepath.name
+                raise
+            files_processed = i
+            last_file = filepath.name
+            if drawers == 0 and not dry_run:
+                files_skipped += 1
+            else:
+                total_drawers += drawers
+                room_counts[room] += 1
+                if not dry_run:
+                    print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
+
+        if not dry_run:
+            # Cross-wing topic tunnels: after every file in this wing has been
+            # processed, link this wing to any other wing that shares a
+            # confirmed TOPIC label. Out of scope for v1: manifest-dependency
+            # overlap, per-topic allow/deny lists, search-result surfacing.
+            try:
+                tunnels_added = _compute_topic_tunnels_for_wing(wing)
+                if tunnels_added:
+                    print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
+            except Exception as e:
+                # Tunnel computation must never fail a mine — degrade quietly.
+                print(
+                    f"\n  WARNING: topic tunnel computation skipped — {e}",
+                    file=sys.stderr,
+                )
+
+        print(f"\n{'=' * 55}")
+        print("  Done.")
+        print(f"  Files processed: {len(files) - files_skipped}")
+        print(f"  Files skipped (already filed): {files_skipped}")
+        print(f"  Drawers filed: {total_drawers}")
+        print("\n  By room:")
+        for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
+            print(f"    {room:20} {count} files")
+        print('\n  Next: mempalace search "what you\'re looking for"')
+        print(f"{'=' * 55}\n")
+    except KeyboardInterrupt:
+        # Idempotent re-mine: deterministic drawer IDs mean already-filed
+        # drawers upsert to the same row on next run, so partial progress
+        # is safe to leave in place. A second Ctrl-C during this print
+        # propagates to the default handler — we don't try to catch
+        # everything.
+        print("\n\n  Mine interrupted.")
+        print(f"    files_processed: {files_processed}/{len(files)}")
+        print(f"    drawers_filed:   {total_drawers}")
+        print(f"    last_file:       {last_file or '<none>'}")
+        print(
+            f"\n  Re-run `mempalace mine {project_dir}` to resume — "
+            "already-filed drawers are\n  upserted idempotently and will not duplicate.\n"
         )
-        if drawers == 0 and not dry_run:
-            files_skipped += 1
-        else:
-            total_drawers += drawers
-            room_counts[room] += 1
-            if not dry_run:
-                print(f"  + [{i:4}/{len(files)}] {filepath.name[:50]:50} +{drawers}")
+        sys.exit(130)
+    finally:
+        # Clean up the hooks-side PID lock if it points at us. Stale
+        # entries already pass _pid_alive() == False on POSIX, but
+        # actively removing the file makes the state observable
+        # (callers can stat it) and avoids accidental PID reuse on
+        # short-lived test runs. Only remove if the file claims our
+        # own PID — never another process's.
+        _cleanup_mine_pid_file()
 
-    if not dry_run:
-        # Cross-wing topic tunnels: after every file in this wing has been
-        # processed, link this wing to any other wing that shares a
-        # confirmed TOPIC label. Out of scope for v1: manifest-dependency
-        # overlap, per-topic allow/deny lists, search-result surfacing.
-        try:
-            tunnels_added = _compute_topic_tunnels_for_wing(wing)
-            if tunnels_added:
-                print(f"\n  Topic tunnels: +{tunnels_added} cross-wing link(s)")
-        except Exception as e:
-            # Tunnel computation must never fail a mine — degrade quietly.
-            print(f"\n  WARNING: topic tunnel computation skipped — {e}", file=sys.stderr)
 
-    print(f"\n{'=' * 55}")
-    print("  Done.")
-    print(f"  Files processed: {len(files) - files_skipped}")
-    print(f"  Files skipped (already filed): {files_skipped}")
-    print(f"  Drawers filed: {total_drawers}")
-    print("\n  By room:")
-    for room, count in sorted(room_counts.items(), key=lambda x: x[1], reverse=True):
-        print(f"    {room:20} {count} files")
-    print('\n  Next: mempalace search "what you\'re looking for"')
-    print(f"{'=' * 55}\n")
+def _cleanup_mine_pid_file() -> None:
+    """Remove the global mine PID file if it currently points at us.
+
+    The PID file (``~/.mempalace/hook_state/mine.pid``, written by the
+    hook in :func:`mempalace.hooks_cli._spawn_mine`) tracks the PID of
+    the most recently spawned mine subprocess so the hook can dedup
+    concurrent auto-ingest fires. When that subprocess exits — cleanly,
+    on error, or via Ctrl-C — it should remove its own entry so the
+    next hook fire isn't briefly fooled by a stale PID before
+    ``_pid_alive`` returns False.
+
+    We only delete the file if it claims our own PID; any other PID is
+    left alone (could be an unrelated mine running concurrently from
+    a different worktree / session).
+    """
+    try:
+        from .hooks_cli import _MINE_PID_FILE
+    except Exception:
+        return
+    try:
+        if not _MINE_PID_FILE.exists():
+            return
+        recorded = _MINE_PID_FILE.read_text().strip()
+        if recorded and recorded.isdigit() and int(recorded) == os.getpid():
+            _MINE_PID_FILE.unlink()
+    except OSError:
+        # Best-effort cleanup; never fail the mine over PID bookkeeping.
+        pass
 
 
 def _compute_topic_tunnels_for_wing(wing: str) -> int:

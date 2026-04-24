@@ -156,6 +156,64 @@ def cmd_init(args):
     # Pass 3: protect git repos from accidentally committing per-project files
     _ensure_mempalace_files_gitignored(args.dir)
 
+    # Pass 4: offer to run mine immediately. The directory just had its
+    # rooms + entities set up, so 99% of users will mine next anyway —
+    # asking here removes the "remember to type the next command" friction.
+    # `--yes` skips the prompt and auto-mines (non-interactive path).
+    _maybe_run_mine_after_init(args, cfg)
+
+
+def _maybe_run_mine_after_init(args, cfg) -> None:
+    """Prompt the user to mine the directory just initialised, or auto-mine
+    when ``--yes`` was passed. Extracted so the prompt path is unit-testable.
+
+    Mine errors are surfaced (not swallowed): a failing mine exits with a
+    non-zero status via :func:`sys.exit` so downstream scripts can see it.
+    """
+    from .miner import mine, scan_project
+
+    project_dir = args.dir
+    auto = bool(getattr(args, "yes", False))
+
+    # Pre-scan so the user knows roughly what they're agreeing to before
+    # the prompt. The scan is fast and we'd run it inside mine() anyway.
+    try:
+        files = scan_project(project_dir)
+        file_count = len(files)
+    except Exception:
+        file_count = None
+
+    if auto:
+        print("\n  Auto-mining (--yes).")
+    else:
+        scope = (
+            f" (~{file_count} files in scope)"
+            if isinstance(file_count, int) and file_count > 0
+            else ""
+        )
+        print(f"\n  Ready to mine{scope}.")
+        try:
+            answer = input("  Mine this directory now? [Y/n] ").strip().lower()
+        except EOFError:
+            # Non-interactive stdin (e.g. piped) — treat like decline so
+            # we don't block. User can re-run with --yes to opt in.
+            answer = "n"
+        if answer not in ("", "y", "yes"):
+            print(f"\n  Skipped. Run `mempalace mine {project_dir}` when ready.")
+            return
+
+    palace_path = cfg.palace_path
+    try:
+        mine(project_dir=project_dir, palace_path=palace_path)
+    except KeyboardInterrupt:
+        # mine() handles its own SIGINT summary + sys.exit(130); re-raise
+        # any KeyboardInterrupt that escapes (shouldn't happen) so the
+        # shell still sees a clean interrupt rather than a swallowed one.
+        raise
+    except Exception as e:
+        print(f"\n  ERROR: mine failed: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
 def cmd_mine(args):
     palace_path = os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
