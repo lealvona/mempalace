@@ -237,6 +237,23 @@ class MempalaceConfig:
         return normalized
 
     @property
+    def embedding_device(self):
+        """Hardware device for the ONNX embedding model.
+
+        Values: ``"auto"`` (default), ``"cpu"``, ``"cuda"``, ``"coreml"``,
+        ``"dml"``. Read from env ``MEMPALACE_EMBEDDING_DEVICE`` first, then
+        ``embedding_device`` in ``config.json``, then ``"auto"``.
+
+        ``auto`` resolves to the first available accelerator at runtime via
+        :mod:`mempalace.embedding`; requesting an unavailable accelerator
+        logs a warning and falls back to CPU.
+        """
+        env_val = os.environ.get("MEMPALACE_EMBEDDING_DEVICE")
+        if env_val:
+            return env_val.strip().lower()
+        return str(self._file_config.get("embedding_device", "auto")).strip().lower()
+
+    @property
     def hook_silent_save(self):
         """Whether the stop hook saves directly (True) or blocks for MCP calls (False)."""
         return self._file_config.get("hooks", {}).get("silent_save", True)

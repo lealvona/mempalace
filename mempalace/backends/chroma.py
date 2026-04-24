@@ -405,6 +405,23 @@ class ChromaBackend(BaseBackend):
         self._freshness: dict[str, tuple[int, float]] = {}
         self._closed = False
 
+    @staticmethod
+    def _resolve_embedding_function():
+        """Return the EF for the user's ``embedding_device`` setting.
+
+        Both ``get_collection`` and ``get_or_create_collection`` must receive
+        the EF explicitly — ChromaDB 1.x does not persist it with the
+        collection, so a reader that omits the argument silently gets the
+        library default and its queries won't match the writer's vectors.
+        """
+        try:
+            from ..embedding import get_embedding_function
+
+            return get_embedding_function()
+        except Exception:
+            logger.exception("Failed to build embedding function; using chromadb default")
+            return None
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -532,12 +549,15 @@ class ChromaBackend(BaseBackend):
         if options and isinstance(options, dict):
             hnsw_space = options.get("hnsw_space", hnsw_space)
 
+        ef = self._resolve_embedding_function()
+        ef_kwargs = {"embedding_function": ef} if ef is not None else {}
+
         if create:
             collection = client.get_or_create_collection(
-                collection_name, metadata={"hnsw:space": hnsw_space}
+                collection_name, metadata={"hnsw:space": hnsw_space}, **ef_kwargs
             )
         else:
-            collection = client.get_collection(collection_name)
+            collection = client.get_collection(collection_name, **ef_kwargs)
         return ChromaCollection(collection)
 
     def close_palace(self, palace) -> None:
@@ -578,8 +598,10 @@ class ChromaBackend(BaseBackend):
         self, palace_path: str, collection_name: str, hnsw_space: str = "cosine"
     ) -> ChromaCollection:
         """Create (not get-or-create) ``collection_name`` with the given HNSW space."""
+        ef = self._resolve_embedding_function()
+        ef_kwargs = {"embedding_function": ef} if ef is not None else {}
         collection = self._client(palace_path).create_collection(
-            collection_name, metadata={"hnsw:space": hnsw_space}
+            collection_name, metadata={"hnsw:space": hnsw_space}, **ef_kwargs
         )
         return ChromaCollection(collection)
 

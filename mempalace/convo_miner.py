@@ -332,31 +332,44 @@ def _file_chunks_locked(collection, source_file, chunks, wing, room, agent, extr
         except Exception:
             pass
 
+        # Batch the whole file into one upsert so the embedding model runs
+        # a single forward pass for all chunks — dramatically faster than
+        # one call per chunk, especially on GPU where per-call overhead
+        # dominates over the actual matmul.
+        batch_docs: list = []
+        batch_ids: list = []
+        batch_metas: list = []
+        filed_at = datetime.now().isoformat()
         for chunk in chunks:
             chunk_room = chunk.get("memory_type", room) if extract_mode == "general" else room
             if extract_mode == "general":
                 room_counts_delta[chunk_room] += 1
             drawer_id = f"drawer_{wing}_{chunk_room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+            batch_docs.append(chunk["content"])
+            batch_ids.append(drawer_id)
+            batch_metas.append(
+                {
+                    "wing": wing,
+                    "room": chunk_room,
+                    "hall": _detect_hall_cached(chunk["content"]),
+                    "source_file": source_file,
+                    "chunk_index": chunk["chunk_index"],
+                    "added_by": agent,
+                    "filed_at": filed_at,
+                    "ingest_mode": "convos",
+                    "extract_mode": extract_mode,
+                    "normalize_version": NORMALIZE_VERSION,
+                }
+            )
+
+        if batch_docs:
             try:
                 collection.upsert(
-                    documents=[chunk["content"]],
-                    ids=[drawer_id],
-                    metadatas=[
-                        {
-                            "wing": wing,
-                            "room": chunk_room,
-                            "hall": _detect_hall_cached(chunk["content"]),
-                            "source_file": source_file,
-                            "chunk_index": chunk["chunk_index"],
-                            "added_by": agent,
-                            "filed_at": datetime.now().isoformat(),
-                            "ingest_mode": "convos",
-                            "extract_mode": extract_mode,
-                            "normalize_version": NORMALIZE_VERSION,
-                        }
-                    ],
+                    documents=batch_docs,
+                    ids=batch_ids,
+                    metadatas=batch_metas,
                 )
-                drawers_added += 1
+                drawers_added = len(batch_docs)
             except Exception as e:
                 if "already exists" not in str(e).lower():
                     raise

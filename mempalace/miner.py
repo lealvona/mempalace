@@ -14,6 +14,7 @@ import fnmatch
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
+from typing import Optional
 
 from .palace import (
     NORMALIZE_VERSION,
@@ -633,40 +634,62 @@ def _extract_entities_for_metadata(content: str) -> str:
     return ";".join(capped)
 
 
+def _build_drawer_metadata(
+    wing: str,
+    room: str,
+    source_file: str,
+    chunk_index: int,
+    agent: str,
+    content: str,
+    source_mtime: Optional[float],
+) -> dict:
+    """Build the metadata dict for one drawer without upserting.
+
+    Split out from ``add_drawer`` so ``process_file`` can batch all chunks
+    of a file into a single ``collection.upsert`` — one embedding forward
+    pass per batch instead of per chunk.
+    """
+    metadata = {
+        "wing": wing,
+        "room": room,
+        "source_file": source_file,
+        "chunk_index": chunk_index,
+        "added_by": agent,
+        "filed_at": datetime.now().isoformat(),
+        "normalize_version": NORMALIZE_VERSION,
+    }
+    if source_mtime is not None:
+        metadata["source_mtime"] = source_mtime
+    metadata["hall"] = detect_hall(content)
+    entities = _extract_entities_for_metadata(content)
+    if entities:
+        metadata["entities"] = entities
+    return metadata
+
+
 def add_drawer(
     collection, wing: str, room: str, content: str, source_file: str, chunk_index: int, agent: str
 ):
-    """Add one drawer to the palace."""
+    """Add one drawer to the palace.
+
+    Kept for backward compatibility with external callers. In-tree the
+    miner uses ``_build_drawer_metadata`` + a batched ``collection.upsert``
+    to amortize the embedding model's forward-pass cost across chunks.
+    """
     drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk_index)).encode()).hexdigest()[:24]}"
     try:
-        metadata = {
-            "wing": wing,
-            "room": room,
-            "source_file": source_file,
-            "chunk_index": chunk_index,
-            "added_by": agent,
-            "filed_at": datetime.now().isoformat(),
-            "normalize_version": NORMALIZE_VERSION,
-        }
-        # Store file mtime so we can detect modifications later.
-        try:
-            metadata["source_mtime"] = os.path.getmtime(source_file)
-        except OSError:
-            pass
-        # Tag with hall for graph connectivity within wings
-        metadata["hall"] = detect_hall(content)
-        # Tag with entity names for filterable search
-        entities = _extract_entities_for_metadata(content)
-        if entities:
-            metadata["entities"] = entities
-        collection.upsert(
-            documents=[content],
-            ids=[drawer_id],
-            metadatas=[metadata],
-        )
-        return True
-    except Exception:
-        raise
+        source_mtime = os.path.getmtime(source_file)
+    except OSError:
+        source_mtime = None
+    metadata = _build_drawer_metadata(
+        wing, room, source_file, chunk_index, agent, content, source_mtime
+    )
+    collection.upsert(
+        documents=[content],
+        ids=[drawer_id],
+        metadatas=[metadata],
+    )
+    return True
 
 
 # =============================================================================
@@ -725,19 +748,42 @@ def process_file(
         except Exception:
             pass
 
-        drawers_added = 0
+        # Batch all chunks of this file into a single upsert so the embedding
+        # model runs one forward pass over the whole file instead of N passes
+        # of one chunk each. On CPU this is typically a 10-30x speedup; on
+        # GPU the speedup is larger because per-call overhead dominates.
+        try:
+            source_mtime = os.path.getmtime(source_file)
+        except OSError:
+            source_mtime = None
+
+        batch_docs: list = []
+        batch_ids: list = []
+        batch_metas: list = []
         for chunk in chunks:
-            added = add_drawer(
-                collection=collection,
-                wing=wing,
-                room=room,
-                content=chunk["content"],
-                source_file=source_file,
-                chunk_index=chunk["chunk_index"],
-                agent=agent,
+            drawer_id = f"drawer_{wing}_{room}_{hashlib.sha256((source_file + str(chunk['chunk_index'])).encode()).hexdigest()[:24]}"
+            batch_docs.append(chunk["content"])
+            batch_ids.append(drawer_id)
+            batch_metas.append(
+                _build_drawer_metadata(
+                    wing,
+                    room,
+                    source_file,
+                    chunk["chunk_index"],
+                    agent,
+                    chunk["content"],
+                    source_mtime,
+                )
             )
-            if added:
-                drawers_added += 1
+
+        drawers_added = 0
+        if batch_docs:
+            collection.upsert(
+                documents=batch_docs,
+                ids=batch_ids,
+                metadatas=batch_metas,
+            )
+            drawers_added = len(batch_docs)
 
         # Build closet — the searchable index pointing to these drawers.
         # Purge first: a re-mine (mtime change or normalize_version bump) must
@@ -868,6 +914,8 @@ def mine(
     if limit > 0:
         files = files[:limit]
 
+    from .embedding import describe_device
+
     print(f"\n{'=' * 55}")
     print("  MemPalace Mine")
     print(f"{'=' * 55}")
@@ -875,6 +923,7 @@ def mine(
     print(f"  Rooms:   {', '.join(r['name'] for r in rooms)}")
     print(f"  Files:   {len(files)}")
     print(f"  Palace:  {palace_path}")
+    print(f"  Device:  {describe_device()}")
     if dry_run:
         print("  DRY RUN — nothing will be filed")
     if not respect_gitignore:
