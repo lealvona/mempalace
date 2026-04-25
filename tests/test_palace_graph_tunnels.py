@@ -156,9 +156,15 @@ class TestTopicTunnels:
         assert len(created) == 1
         assert created[0]["source"]["wing"] in {"wing_alpha", "wing_beta"}
         assert created[0]["target"]["wing"] in {"wing_alpha", "wing_beta"}
-        # Room is the topic itself (case preserved from the first wing).
-        assert created[0]["source"]["room"] == "OpenAPI"
+        # Room is namespaced with the ``topic:`` prefix so it can't collide
+        # with a literal folder-derived room of the same name. Casing of the
+        # topic is preserved for display.
+        assert created[0]["source"]["room"] == "topic:OpenAPI"
+        assert created[0]["target"]["room"] == "topic:OpenAPI"
+        assert created[0]["kind"] == "topic"
+        # Label carries the human-readable topic without the prefix.
         assert "OpenAPI" in created[0]["label"]
+        assert "topic:OpenAPI" not in created[0]["label"]
 
         # Tunnel is retrievable via the standard list_tunnels API.
         listed = palace_graph.list_tunnels()
@@ -187,7 +193,7 @@ class TestTopicTunnels:
         created = palace_graph.compute_topic_tunnels(topics_by_wing, min_count=2)
         # Two shared topics × one wing pair = two tunnels.
         rooms = sorted(t["source"]["room"] for t in created)
-        assert rooms == ["Angular", "OpenAPI"]
+        assert rooms == ["topic:Angular", "topic:OpenAPI"]
 
     def test_compute_topic_tunnels_case_insensitive_overlap(self, tmp_path, monkeypatch):
         _use_tmp_tunnel_file(monkeypatch, tmp_path)
@@ -258,3 +264,38 @@ class TestTopicTunnels:
         # not multiply the stored tunnels.
         assert first[0]["id"] == second[0]["id"]
         assert len(palace_graph.list_tunnels()) == 1
+
+    def test_topic_tunnel_room_does_not_collide_with_literal_room(self, tmp_path, monkeypatch):
+        """Regression: a literal "Angular" folder-room and a topic tunnel
+        for "Angular" must resolve to distinct endpoints so ``follow_tunnels``
+        from the real room doesn't accidentally surface topic connections
+        (issue raised in review of #1184)."""
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+
+        # Explicit tunnel anchored at a literal "Angular" room in wing_alpha.
+        palace_graph.create_tunnel(
+            "wing_alpha", "Angular", "wing_gamma", "frontend", label="explicit"
+        )
+        # Topic tunnel between the same wings that share the "Angular" topic.
+        palace_graph.compute_topic_tunnels(
+            {"wing_alpha": ["Angular"], "wing_beta": ["Angular"]}, min_count=1
+        )
+
+        # follow_tunnels on the literal Angular room only sees the explicit link.
+        literal = palace_graph.follow_tunnels("wing_alpha", "Angular")
+        assert len(literal) == 1
+        assert literal[0]["connected_wing"] == "wing_gamma"
+
+        # The topic tunnel is stored under the namespaced room.
+        topical = palace_graph.follow_tunnels("wing_alpha", "topic:Angular")
+        assert len(topical) == 1
+        assert topical[0]["connected_wing"] == "wing_beta"
+
+    def test_topic_tunnels_carry_kind_field(self, tmp_path, monkeypatch):
+        _use_tmp_tunnel_file(monkeypatch, tmp_path)
+        palace_graph.create_tunnel("wing_a", "auth", "wing_b", "users", label="x")
+        palace_graph.compute_topic_tunnels({"wing_a": ["Redis"], "wing_b": ["Redis"]}, min_count=1)
+
+        tunnels = palace_graph.list_tunnels()
+        kinds = sorted(t["kind"] for t in tunnels)
+        assert kinds == ["explicit", "topic"]

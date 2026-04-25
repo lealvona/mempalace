@@ -362,6 +362,7 @@ def create_tunnel(
     label: str = "",
     source_drawer_id: str = None,
     target_drawer_id: str = None,
+    kind: str = "explicit",
 ):
     """Create an explicit (symmetric) tunnel between two locations in the palace.
 
@@ -382,6 +383,11 @@ def create_tunnel(
         label: Description of the connection.
         source_drawer_id: Optional specific drawer ID.
         target_drawer_id: Optional specific drawer ID.
+        kind: Tunnel category — ``"explicit"`` (default, user-created link
+            between real rooms) or ``"topic"`` (auto-generated cross-wing
+            topical link where rooms are synthetic ``topic:<name>``
+            identifiers). Preserved on the stored dict so readers can
+            distinguish real-room traversals from topic connections.
 
     Returns:
         The stored tunnel dict.
@@ -401,6 +407,7 @@ def create_tunnel(
         "source": {"wing": source_wing, "room": source_room},
         "target": {"wing": target_wing, "room": target_room},
         "label": label,
+        "kind": kind,
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     if source_drawer_id:
@@ -511,14 +518,30 @@ def follow_tunnels(wing: str, room: str, col=None, config=None):
 # ``~/.mempalace/known_entities.json`` under ``topics_by_wing``.
 #
 # Tunnels are created via the existing ``create_tunnel`` API so they share
-# storage and dedup with explicit tunnels. The room is the topic name —
-# this matches the "two wings share an idea" mental model and keeps the
-# graph homogeneous.
+# storage and dedup with explicit tunnels. The room is a synthetic
+# ``topic:<original-casing>`` identifier — the ``topic:`` prefix namespaces
+# these tunnels away from literal folder-derived rooms so a wing with an
+# auto-detected "Angular" folder room and a "shared topic: Angular" tunnel
+# remain distinct at ``follow_tunnels`` / ``list_tunnels`` time. The prefix
+# is also visible to any LLM scanning the tunnel list. The ``kind: "topic"``
+# field on the stored dict gives callers a machine-readable discriminator.
+
+TOPIC_ROOM_PREFIX = "topic:"
 
 
 def _normalize_topic(name: str) -> str:
     """Lowercase + strip topics for case-insensitive overlap detection."""
     return str(name).strip().lower()
+
+
+def topic_room(name: str) -> str:
+    """Return the synthetic room identifier for a topic tunnel.
+
+    Prefixing avoids collisions with literal folder-derived rooms of the
+    same name (e.g. a wing that has both an "Angular" folder room and an
+    "Angular" topic tunnel).
+    """
+    return f"{TOPIC_ROOM_PREFIX}{name}"
 
 
 def compute_topic_tunnels(
@@ -586,13 +609,15 @@ def compute_topic_tunnels(
             for key in sorted(shared_keys):
                 # Prefer the casing from whichever wing sorts first — both
                 # are valid; this just keeps the displayed room consistent.
-                room = topics_a[key] if topics_a[key] else topics_b[key]
+                topic_name = topics_a[key] if topics_a[key] else topics_b[key]
+                room = topic_room(topic_name)
                 tunnel = create_tunnel(
                     source_wing=wa,
                     source_room=room,
                     target_wing=wb,
                     target_room=room,
-                    label=f"{label_prefix}: {room}",
+                    label=f"{label_prefix}: {topic_name}",
+                    kind="topic",
                 )
                 created.append(tunnel)
     return created

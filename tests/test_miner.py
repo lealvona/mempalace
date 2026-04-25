@@ -536,7 +536,10 @@ def test_mine_creates_topic_tunnels_for_shared_topics(tmp_path, monkeypatch):
     listed = palace_graph.list_tunnels()
     assert len(listed) == 1
     rooms = {listed[0]["source"]["room"], listed[0]["target"]["room"]}
-    assert rooms == {"foo"}
+    # Topic tunnels use a ``topic:<name>`` synthetic room so they can't
+    # collide with literal folder-derived rooms of the same name.
+    assert rooms == {"topic:foo"}
+    assert listed[0]["kind"] == "topic"
     wings = {listed[0]["source"]["wing"], listed[0]["target"]["wing"]}
     assert wings == {"wing_one", "wing_two"}
 
