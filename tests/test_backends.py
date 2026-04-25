@@ -336,6 +336,42 @@ def test_chroma_backend_creates_collection_with_cosine_distance(tmp_path):
     assert col.metadata.get("hnsw:space") == "cosine"
 
 
+def test_chroma_backend_sets_hnsw_bloat_guard_on_creation(tmp_path):
+    """The HNSW guard from #344 must land on freshly-created collection metadata.
+
+    Without batch_size + sync_threshold, mining ~10K+ drawers triggers the
+    resize+persist drift that bloats link_lists.bin into hundreds of GB sparse
+    and segfaults `status` / `search` / `repair`. The guard belongs at
+    collection-creation time so every fresh palace gets it without needing
+    a runtime retrofit. Asserting both keys land on the persisted metadata
+    also covers the #1161 "config silently dropped" concern at CI time.
+    """
+    palace_path = tmp_path / "palace"
+
+    ChromaBackend().get_collection(
+        str(palace_path),
+        collection_name="mempalace_drawers",
+        create=True,
+    )
+
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    assert col.metadata.get("hnsw:batch_size") == 50_000
+    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+
+
+def test_chroma_backend_create_collection_sets_hnsw_bloat_guard(tmp_path):
+    """Same guard must apply via the legacy create_collection() path."""
+    palace_path = tmp_path / "palace"
+
+    ChromaBackend().create_collection(str(palace_path), "mempalace_drawers")
+
+    client = chromadb.PersistentClient(path=str(palace_path))
+    col = client.get_collection("mempalace_drawers")
+    assert col.metadata.get("hnsw:batch_size") == 50_000
+    assert col.metadata.get("hnsw:sync_threshold") == 50_000
+
+
 def test_fix_blob_seq_ids_converts_blobs_to_integers(tmp_path):
     """Simulate a ChromaDB 0.6.x database with BLOB seq_ids and verify repair."""
     db_path = tmp_path / "chroma.sqlite3"

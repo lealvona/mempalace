@@ -60,6 +60,7 @@ from .version import __version__  # noqa: E402
 from .backends.chroma import (  # noqa: E402
     ChromaBackend,
     ChromaCollection,
+    _HNSW_BLOAT_GUARD,
     _pin_hnsw_threads,
     hnsw_capacity_status,
 )
@@ -285,7 +286,11 @@ def _get_collection(create=False):
             # so the retrofit runs every time _get_collection opens a cache).
             raw = client.get_or_create_collection(
                 _config.collection_name,
-                metadata={"hnsw:space": "cosine", "hnsw:num_threads": 1},
+                metadata={
+                    "hnsw:space": "cosine",
+                    "hnsw:num_threads": 1,
+                    **_HNSW_BLOAT_GUARD,
+                },
             )
             _pin_hnsw_threads(raw)
             _collection_cache = ChromaCollection(raw)

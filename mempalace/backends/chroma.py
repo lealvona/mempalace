@@ -28,6 +28,31 @@ _REQUIRED_OPERATORS = frozenset({"$eq", "$ne", "$in", "$nin", "$and", "$or", "$c
 _OPTIONAL_OPERATORS = frozenset({"$gt", "$gte", "$lt", "$lte"})
 _SUPPORTED_OPERATORS = _REQUIRED_OPERATORS | _OPTIONAL_OPERATORS
 
+# HNSW tuning to prevent link_lists.bin bloat on large mines (#344).
+#
+# With default params (batch_size=100, sync_threshold=1000, initial capacity
+# 1000), inserting tens of thousands of drawers triggers ~30 index resizes
+# and hundreds of persistDirty() calls. persistDirty uses relative seek
+# positioning in link_lists.bin; accumulated seek drift across resize cycles
+# causes the OS to extend the sparse file with zero-filled regions, each
+# cycle compounding the next. Result: link_lists.bin grows into hundreds of
+# GB sparse, after which `status`/`search`/`repair` segfault.
+#
+# Setting large batch and sync thresholds at collection creation defers
+# persistence until a single large batch completes, breaking the resize+
+# persist feedback loop. Empirically validated on a 39,792-drawer rebuild
+# (palace 376 MB, link_lists.bin 0 bytes, no segfault) in 2026-04.
+#
+# Note: chromadb 1.5.x exposes a `collection.modify(configuration={"hnsw":
+# {"batch_size": ..., "sync_threshold": ...}})` retrofit path for already-
+# created collections (`UpdateHNSWConfiguration` in chromadb's API), but
+# this PR doesn't pursue that — once link_lists.bin has bloated, the index
+# is already corrupt and the only known recovery is a fresh mine.
+_HNSW_BLOAT_GUARD = {
+    "hnsw:batch_size": 50_000,
+    "hnsw:sync_threshold": 50_000,
+}
+
 
 def _validate_where(where: Optional[dict]) -> None:
     """Scan a where-clause for unknown operators and raise ``UnsupportedFilterError``.
@@ -1014,7 +1039,11 @@ class ChromaBackend(BaseBackend):
         if create:
             collection = client.get_or_create_collection(
                 collection_name,
-                metadata={"hnsw:space": hnsw_space, "hnsw:num_threads": 1},
+                metadata={
+                    "hnsw:space": hnsw_space,
+                    "hnsw:num_threads": 1,
+                    **_HNSW_BLOAT_GUARD,
+                },
                 **ef_kwargs,
             )
         else:
@@ -1064,7 +1093,11 @@ class ChromaBackend(BaseBackend):
         ef_kwargs = {"embedding_function": ef} if ef is not None else {}
         collection = self._client(palace_path).create_collection(
             collection_name,
-            metadata={"hnsw:space": hnsw_space, "hnsw:num_threads": 1},
+            metadata={
+                "hnsw:space": hnsw_space,
+                "hnsw:num_threads": 1,
+                **_HNSW_BLOAT_GUARD,
+            },
             **ef_kwargs,
         )
         return ChromaCollection(collection)
