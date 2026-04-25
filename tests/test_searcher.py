@@ -138,17 +138,22 @@ class TestBM25NoneSafety:
 
     def test_tokenize_handles_none(self):
         from mempalace.searcher import _tokenize
+
         assert _tokenize(None) == []
 
     def test_tokenize_handles_empty_string(self):
         from mempalace.searcher import _tokenize
+
         assert _tokenize("") == []
 
     def test_bm25_scores_does_not_crash_on_none_documents(self):
         """A ``None`` mixed into the corpus must yield score 0.0 for that doc
         and finite scores for the rest, not raise AttributeError."""
         from mempalace.searcher import _bm25_scores
-        scores = _bm25_scores("postgres migration", ["postgres migration done", None, "kafka rebalance"])
+
+        scores = _bm25_scores(
+            "postgres migration", ["postgres migration done", None, "kafka rebalance"]
+        )
         assert len(scores) == 3
         assert scores[1] == 0.0
         assert scores[0] > 0.0
