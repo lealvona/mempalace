@@ -1,6 +1,7 @@
 """Tests for mempalace.cli — the main CLI dispatcher."""
 
 import argparse
+import shlex
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -221,7 +222,10 @@ def test_maybe_run_mine_prompt_declined_prints_hint(tmp_path, capsys):
         _maybe_run_mine_after_init(args, cfg)
         mock_mine.assert_not_called()
     out = capsys.readouterr().out
-    assert f"mempalace mine {tmp_path}" in out
+    # shlex.quote is a no-op on POSIX-safe paths but wraps Windows paths
+    # (which contain backslashes) in single quotes, so the assertion has
+    # to mirror what the production code actually emits.
+    assert f"mempalace mine {shlex.quote(str(tmp_path))}" in out
     assert "Skipped" in out
 
 
@@ -297,9 +301,11 @@ def test_maybe_run_mine_decline_quotes_path_with_spaces(tmp_path, capsys):
     ):
         _maybe_run_mine_after_init(args, cfg)
     out = capsys.readouterr().out
-    # shlex.quote wraps paths with spaces in single quotes.
-    assert f"mempalace mine '{spaced_dir}'" in out
-    # And the bare unquoted form is NOT printed (would break paste).
+    # shlex.quote wraps paths with spaces (and Windows backslashes) in
+    # single quotes — the assertion must use the same shlex form so the
+    # test passes on every platform's tmp_path layout.
+    assert f"mempalace mine {shlex.quote(str(spaced_dir))}" in out
+    # Bare unquoted form must NOT appear — that's the bug we're guarding.
     assert f"mempalace mine {spaced_dir} " not in out
     assert f"mempalace mine {spaced_dir}`" not in out
 

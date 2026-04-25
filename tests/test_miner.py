@@ -1,4 +1,5 @@
 import os
+import shlex
 import shutil
 import tempfile
 from pathlib import Path
@@ -674,7 +675,10 @@ def test_mine_keyboard_interrupt_quotes_path_with_spaces_in_resume_hint(tmp_path
             mine(str(project_root), str(palace_path))
 
     out = capsys.readouterr().out
-    assert f"mempalace mine '{project_root}'" in out
+    # Use shlex.quote so the assertion matches whatever the production
+    # code emits on this platform (POSIX paths with spaces vs Windows
+    # paths with backslashes both end up wrapped in single quotes).
+    assert f"mempalace mine {shlex.quote(str(project_root))}" in out
 
 
 def test_mine_cleans_up_pid_file_on_interrupt(tmp_path):
