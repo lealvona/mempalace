@@ -1483,6 +1483,14 @@ def test_merge_tier_fields_heuristic_yes_llm_no_keeps_heuristic_bool():
         f"Merged result must KEEP heuristic's True, not flip to False. "
         f"Got: {res}"
     )
+    # The bool and the confidence are paired — both must come from the
+    # heuristic. The mocked LLM returned 0.90; if the merge accidentally
+    # took LLM's confidence, this would equal 0.90.
+    assert res["confidence"] != 0.90, (
+        f"Merged confidence equals the mocked LLM's 0.90 — looks like "
+        f"LLM's confidence leaked through the merge. Heuristic's confidence "
+        f"must be preserved alongside its bool. Got: {res}"
+    )
     # Persona/user/platform from LLM should still be merged in.
     assert res["agent_persona_names"] == [
         "Echo",
@@ -1539,6 +1547,13 @@ def test_merge_tier_fields_heuristic_no_no_personas_leak():
     assert (
         res["agent_persona_names"] == []
     ), f"No personas should leak when both tiers report none. Got: {res}"
+    # Heuristic owns confidence. Mocked LLM returned 0.95; heuristic's
+    # narrative-branch confidence is 0.9. Verifying we kept 0.9 catches
+    # any future regression that lets LLM confidence override heuristic.
+    assert res["confidence"] == 0.9, (
+        f"Heuristic confidently classified narrative at 0.9; mocked LLM "
+        f"returned 0.95. Merge must keep heuristic's 0.9. Got: {res}"
+    )
 
 
 def test_merge_tier_fields_heuristic_yes_llm_yes_combines_evidence():
@@ -1596,6 +1611,75 @@ def test_merge_tier_fields_heuristic_yes_llm_yes_combines_evidence():
     # input (brand-term match), so the combined list has more than just LLM's.
     assert len(res["evidence"]) >= 2, (
         f"Combined evidence should include both heuristic + LLM lines. " f"Got: {res['evidence']}"
+    )
+    # Each entry must carry its tier prefix so on-disk origin.json is
+    # auditable — readers can tell which tier produced which signal line.
+    tier1_lines = [e for e in res["evidence"] if e.startswith("Tier-1 heuristic: ")]
+    tier2_lines = [e for e in res["evidence"] if e.startswith("Tier-2 LLM: ")]
+    assert tier1_lines, (
+        f"Expected at least one 'Tier-1 heuristic: ' prefixed evidence line. "
+        f"Got: {res['evidence']}"
+    )
+    assert tier2_lines, (
+        f"Expected at least one 'Tier-2 LLM: ' prefixed evidence line. " f"Got: {res['evidence']}"
+    )
+    # Every entry should be tier-prefixed (no untagged passthrough).
+    untagged = [
+        e
+        for e in res["evidence"]
+        if not (e.startswith("Tier-1 heuristic: ") or e.startswith("Tier-2 LLM: "))
+    ]
+    assert not untagged, f"Untagged evidence entries leaked into merge: {untagged}"
+
+
+def test_merge_tier_fields_confidence_matches_heuristic_call():
+    """Pin the contract: merged confidence equals what `detect_origin_heuristic`
+    returns for the same samples — independent of what the LLM produced.
+
+    Catches a regression class where some future refactor lets Tier 2's
+    confidence creep back into the merged result.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from mempalace.cli import _run_pass_zero
+    from mempalace.corpus_origin import CorpusOriginResult, detect_origin_heuristic
+
+    samples = _ai_dialogue_samples()
+    expected_confidence = detect_origin_heuristic(samples).confidence
+
+    fake_provider = MagicMock()
+    # LLM picks a deliberately distinct confidence so any leak is visible.
+    llm_distinct_result = CorpusOriginResult(
+        likely_ai_dialogue=True,
+        confidence=0.123456,
+        primary_platform="Claude (Anthropic)",
+        user_name=None,
+        agent_persona_names=[],
+        evidence=["LLM said yes with an unusual confidence"],
+    )
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        project_dir = Path(tmp_dir) / "project"
+        project_dir.mkdir()
+        for i, sample in enumerate(samples):
+            (project_dir / f"log{i}.md").write_text(sample)
+        palace_dir = Path(tmp_dir) / "palace"
+
+        with patch("mempalace.cli.detect_origin_llm", return_value=llm_distinct_result):
+            wrapped = _run_pass_zero(
+                project_dir=str(project_dir),
+                palace_dir=str(palace_dir),
+                llm_provider=fake_provider,
+            )
+
+    assert wrapped is not None
+    res = wrapped["result"]
+    assert res["confidence"] == expected_confidence, (
+        f"Merged confidence {res['confidence']} did not match "
+        f"detect_origin_heuristic's {expected_confidence}. Looks like "
+        f"LLM's 0.123456 (or another source) leaked through the merge."
     )
 
 

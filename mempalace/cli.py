@@ -149,8 +149,21 @@ def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
                 result.user_name = llm_result.user_name
             if llm_result.agent_persona_names:
                 result.agent_persona_names = list(llm_result.agent_persona_names)
-            # Combine evidence — keep both signal trails for the audit record.
-            result.evidence = list(result.evidence) + list(llm_result.evidence)
+            # Combine evidence — keep both signal trails for the audit record,
+            # prefixed so the on-disk origin.json says which tier produced
+            # each entry. Idempotent: re-prefixing an already-tagged entry
+            # is a no-op.
+            tier1_prefix = "Tier-1 heuristic: "
+            tier2_prefix = "Tier-2 LLM: "
+            heuristic_evidence = [
+                str(e) if str(e).startswith(tier1_prefix) else f"{tier1_prefix}{e}"
+                for e in result.evidence
+            ]
+            llm_evidence = [
+                str(e) if str(e).startswith(tier2_prefix) else f"{tier2_prefix}{e}"
+                for e in llm_result.evidence
+            ]
+            result.evidence = heuristic_evidence + llm_evidence
         except Exception as exc:  # noqa: BLE001 — never block init on LLM failure
             print(f"  LLM corpus-origin tier failed ({exc}); using heuristic only.")
 
