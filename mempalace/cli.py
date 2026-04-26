@@ -156,12 +156,12 @@ def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
             tier1_prefix = "Tier-1 heuristic: "
             tier2_prefix = "Tier-2 LLM: "
             heuristic_evidence = [
-                str(e) if str(e).startswith(tier1_prefix) else f"{tier1_prefix}{e}"
-                for e in result.evidence
+                s if s.startswith(tier1_prefix) else f"{tier1_prefix}{s}"
+                for s in (str(e) for e in result.evidence)
             ]
             llm_evidence = [
-                str(e) if str(e).startswith(tier2_prefix) else f"{tier2_prefix}{e}"
-                for e in llm_result.evidence
+                s if s.startswith(tier2_prefix) else f"{tier2_prefix}{s}"
+                for s in (str(e) for e in llm_result.evidence)
             ]
             result.evidence = heuristic_evidence + llm_evidence
         except Exception as exc:  # noqa: BLE001 — never block init on LLM failure

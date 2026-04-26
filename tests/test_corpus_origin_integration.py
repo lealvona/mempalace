@@ -1484,12 +1484,17 @@ def test_merge_tier_fields_heuristic_yes_llm_no_keeps_heuristic_bool():
         f"Got: {res}"
     )
     # The bool and the confidence are paired — both must come from the
-    # heuristic. The mocked LLM returned 0.90; if the merge accidentally
-    # took LLM's confidence, this would equal 0.90.
-    assert res["confidence"] != 0.90, (
-        f"Merged confidence equals the mocked LLM's 0.90 — looks like "
-        f"LLM's confidence leaked through the merge. Heuristic's confidence "
-        f"must be preserved alongside its bool. Got: {res}"
+    # heuristic. Compare to detect_origin_heuristic on the same samples
+    # so this stays correct regardless of what the heuristic computes
+    # for these samples (avoids brittleness vs. a hardcoded sentinel).
+    from mempalace.corpus_origin import detect_origin_heuristic
+
+    expected_confidence = detect_origin_heuristic(_ai_dialogue_samples()).confidence
+    assert res["confidence"] == expected_confidence, (
+        f"Merged confidence {res['confidence']} did not match the heuristic's "
+        f"{expected_confidence} for these samples. The mocked LLM returned "
+        f"0.90; if the merge accidentally took the LLM's confidence, the "
+        f"merged value would not equal the heuristic's. Got: {res}"
     )
     # Persona/user/platform from LLM should still be merged in.
     assert res["agent_persona_names"] == [
