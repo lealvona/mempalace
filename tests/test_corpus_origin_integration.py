@@ -1388,3 +1388,244 @@ def test_no_internal_coordination_jargon_in_source_or_tests():
         "instead of internal phase taxonomy. See "
         "feedback_apply_naming_decision_actively.md."
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Tier 1 / Tier 2 merge-fields (issue 3 follow-up to PR #1211).
+#
+# Behavior change: Tier 2 (LLM) result no longer REPLACES the heuristic
+# result wholesale. Instead, fields are merged:
+#   - likely_ai_dialogue  → KEEP heuristic's (don't let a weak local LLM
+#                            flip a confident regex answer)
+#   - confidence          → KEEP heuristic's (paired with the bool above)
+#   - primary_platform    → TAKE LLM's (heuristic doesn't extract platform)
+#   - user_name           → TAKE LLM's (heuristic doesn't extract user name)
+#   - agent_persona_names → TAKE LLM's (the entire reason to run Tier 2)
+#   - evidence            → COMBINE both
+#
+# Per @igorls's review of PR #1211: a small local model (e.g. Ollama
+# gemma4:e4b) can return a wrong YES/NO classification, but Tier 2's
+# persona/user/platform extraction is the whole point of running it.
+# Merging fields preserves persona-extraction value without letting the
+# weak model flip a confident heuristic.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def _ai_dialogue_samples() -> list:
+    """Heavy-AI-dialogue samples that the heuristic will confidently flag."""
+    return [
+        "User: claude code, please help me debug this MCP integration.\n"
+        "Assistant: Sure. I'll look at the LLM context window and the "
+        "embedding pipeline. Claude Code can run the analysis now.\n"
+        "User: also check ChatGPT compatibility.\n"
+        "Assistant: GPT-4 should handle that. The MCP protocol abstracts it.\n"
+    ] * 5
+
+
+def _narrative_samples() -> list:
+    """Pure-narrative samples that the heuristic will confidently flag NOT-AI."""
+    return [
+        "The plum tree finally bloomed this morning. Mira walked over from "
+        "next door with her coffee and we sat on the porch watching the bees."
+    ] * 5
+
+
+def test_merge_tier_fields_heuristic_yes_llm_no_keeps_heuristic_bool():
+    """When heuristic says AI-dialogue with high confidence and LLM
+    contradicts (says NOT AI-dialogue), the merged result keeps the
+    heuristic's likely_ai_dialogue=True. Igor's PR #1211 review caught
+    this exact failure mode: a local Ollama gemma4:e4b returned a wrong
+    "not AI-dialogue, 0.90" that flipped a correct heuristic answer.
+    """
+    from unittest.mock import MagicMock
+
+    from mempalace.cli import _run_pass_zero
+    from mempalace.corpus_origin import CorpusOriginResult
+
+    # Mock the LLM provider so detect_origin_llm returns a CONTRADICTING result.
+    fake_provider = MagicMock()
+
+    # detect_origin_llm is called inside _run_pass_zero with this provider.
+    # We need to intercept it. Easiest: patch detect_origin_llm directly.
+    from unittest.mock import patch
+
+    # LLM falsely claims not AI-dialogue, but DID extract personas (a real
+    # symptom of weak local models — they sometimes contradict themselves).
+    llm_wrong_result = CorpusOriginResult(
+        likely_ai_dialogue=False,
+        confidence=0.90,
+        primary_platform="Claude (Anthropic)",
+        user_name="Jordan",
+        agent_persona_names=["Echo", "Sparrow", "Cipher"],
+        evidence=["LLM thought this was narrative — wrong call"],
+    )
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        project_dir = Path(tmp_dir) / "project"
+        project_dir.mkdir()
+        for i, sample in enumerate(_ai_dialogue_samples()):
+            (project_dir / f"log{i}.md").write_text(sample)
+        palace_dir = Path(tmp_dir) / "palace"
+
+        with patch("mempalace.cli.detect_origin_llm", return_value=llm_wrong_result):
+            wrapped = _run_pass_zero(
+                project_dir=str(project_dir),
+                palace_dir=str(palace_dir),
+                llm_provider=fake_provider,
+            )
+
+    assert wrapped is not None, "Pass 0 should write origin.json with samples present"
+    res = wrapped["result"]
+    assert res["likely_ai_dialogue"] is True, (
+        f"Heuristic confidently classified AI-dialogue; weak LLM contradicted. "
+        f"Merged result must KEEP heuristic's True, not flip to False. "
+        f"Got: {res}"
+    )
+    # Persona/user/platform from LLM should still be merged in.
+    assert res["agent_persona_names"] == [
+        "Echo",
+        "Sparrow",
+        "Cipher",
+    ], f"LLM-extracted personas must be preserved in the merge. Got: {res}"
+    assert res["user_name"] == "Jordan"
+    assert res["primary_platform"] == "Claude (Anthropic)"
+
+
+def test_merge_tier_fields_heuristic_no_no_personas_leak():
+    """When heuristic confidently says NOT AI-dialogue and LLM agrees
+    (also says NOT AI-dialogue, no personas extracted), merged result
+    keeps NOT AI-dialogue and has no personas. Confirms the merge
+    doesn't accidentally introduce personas where none exist.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from mempalace.cli import _run_pass_zero
+    from mempalace.corpus_origin import CorpusOriginResult
+
+    fake_provider = MagicMock()
+
+    llm_agreeing_result = CorpusOriginResult(
+        likely_ai_dialogue=False,
+        confidence=0.95,
+        primary_platform=None,
+        user_name=None,
+        agent_persona_names=[],
+        evidence=["LLM also classified as narrative"],
+    )
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        project_dir = Path(tmp_dir) / "project"
+        project_dir.mkdir()
+        for i, sample in enumerate(_narrative_samples()):
+            (project_dir / f"diary{i}.md").write_text(sample)
+        palace_dir = Path(tmp_dir) / "palace"
+
+        with patch("mempalace.cli.detect_origin_llm", return_value=llm_agreeing_result):
+            wrapped = _run_pass_zero(
+                project_dir=str(project_dir),
+                palace_dir=str(palace_dir),
+                llm_provider=fake_provider,
+            )
+
+    assert wrapped is not None
+    res = wrapped["result"]
+    assert (
+        res["likely_ai_dialogue"] is False
+    ), f"Both tiers said NOT AI-dialogue; merged result must be False. Got: {res}"
+    assert (
+        res["agent_persona_names"] == []
+    ), f"No personas should leak when both tiers report none. Got: {res}"
+
+
+def test_merge_tier_fields_heuristic_yes_llm_yes_combines_evidence():
+    """When both tiers agree this is AI-dialogue, the merged result keeps
+    heuristic's bool/confidence and takes LLM's extracted persona/user/
+    platform fields. Evidence from BOTH tiers ends up in the combined
+    list.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from mempalace.cli import _run_pass_zero
+    from mempalace.corpus_origin import CorpusOriginResult
+
+    fake_provider = MagicMock()
+
+    llm_agreeing_result = CorpusOriginResult(
+        likely_ai_dialogue=True,
+        confidence=0.98,
+        primary_platform="Claude (Anthropic)",
+        user_name="Jordan",
+        agent_persona_names=["Echo", "Sparrow", "Cipher"],
+        evidence=["LLM-extracted: Claude transcript with three persona names"],
+    )
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        project_dir = Path(tmp_dir) / "project"
+        project_dir.mkdir()
+        for i, sample in enumerate(_ai_dialogue_samples()):
+            (project_dir / f"log{i}.md").write_text(sample)
+        palace_dir = Path(tmp_dir) / "palace"
+
+        with patch("mempalace.cli.detect_origin_llm", return_value=llm_agreeing_result):
+            wrapped = _run_pass_zero(
+                project_dir=str(project_dir),
+                palace_dir=str(palace_dir),
+                llm_provider=fake_provider,
+            )
+
+    assert wrapped is not None
+    res = wrapped["result"]
+    assert res["likely_ai_dialogue"] is True
+    assert res["agent_persona_names"] == ["Echo", "Sparrow", "Cipher"]
+    assert res["user_name"] == "Jordan"
+    assert res["primary_platform"] == "Claude (Anthropic)"
+    # Combined evidence: heuristic produced its own evidence strings AND
+    # LLM produced its own; the merged result should include both signal
+    # trails for audit purposes.
+    evidence_text = " ".join(res["evidence"])
+    assert (
+        "LLM-extracted" in evidence_text
+    ), f"LLM evidence string missing from merged result. Got: {res['evidence']}"
+    # Heuristic always produces at least one evidence line for AI-dialogue
+    # input (brand-term match), so the combined list has more than just LLM's.
+    assert len(res["evidence"]) >= 2, (
+        f"Combined evidence should include both heuristic + LLM lines. " f"Got: {res['evidence']}"
+    )
+
+
+def test_merge_tier_fields_no_llm_provider_returns_heuristic_only():
+    """Backwards compat: when no LLM provider is supplied (the --no-llm
+    path), behavior is identical to today — heuristic-only result, no
+    merge logic fires. This pins the v3.3.4 contract.
+    """
+    from mempalace.cli import _run_pass_zero
+
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        project_dir = Path(tmp_dir) / "project"
+        project_dir.mkdir()
+        for i, sample in enumerate(_ai_dialogue_samples()):
+            (project_dir / f"log{i}.md").write_text(sample)
+        palace_dir = Path(tmp_dir) / "palace"
+
+        wrapped = _run_pass_zero(
+            project_dir=str(project_dir),
+            palace_dir=str(palace_dir),
+            llm_provider=None,
+        )
+
+    assert wrapped is not None
+    res = wrapped["result"]
+    # Heuristic confidently flags AI-dialogue based on brand-term density.
+    assert res["likely_ai_dialogue"] is True
+    # No LLM ran, so persona/user/platform are heuristic's defaults (None / []).
+    assert res["agent_persona_names"] == []
+    assert res["user_name"] is None
+    assert res["primary_platform"] is None

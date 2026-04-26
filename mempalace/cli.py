@@ -129,16 +129,28 @@ def _run_pass_zero(project_dir, palace_dir, llm_provider) -> dict:
     # contract is best-effort: corpus_origin internally falls back to a
     # conservative default on transport/parse failure, so we don't need a
     # try/except here, but we still keep one for any unforeseen exception.
+    #
+    # MERGE-FIELDS, NOT REPLACE: Tier 2's persona/user/platform extraction
+    # is the whole reason to run it, but a weak local model (e.g. Ollama
+    # gemma4:e4b) can return a wrong likely_ai_dialogue/confidence call
+    # that overrides a confident heuristic answer. Per @igorls's review of
+    # PR #1211: keep the heuristic's likely_ai_dialogue + confidence
+    # (don't let a weak LLM flip a confident regex answer), and merge in
+    # LLM's persona-related fields + combined evidence.
     if llm_provider is not None:
         try:
             llm_result = detect_origin_llm(_trim_samples_for_llm(samples), llm_provider)
-            # LLM-tier result wins on platform/persona/user fields; keep the
-            # heuristic evidence appended so the on-disk record retains the
-            # cheap-tier signal trail.
-            llm_result.evidence = list(llm_result.evidence) + [
-                f"Tier-1 heuristic: {e}" for e in result.evidence
-            ]
-            result = llm_result
+            # Heuristic owns: likely_ai_dialogue, confidence (do NOT touch).
+            # LLM contributes: primary_platform, user_name, agent_persona_names
+            # (heuristic doesn't extract any of these).
+            if llm_result.primary_platform:
+                result.primary_platform = llm_result.primary_platform
+            if llm_result.user_name:
+                result.user_name = llm_result.user_name
+            if llm_result.agent_persona_names:
+                result.agent_persona_names = list(llm_result.agent_persona_names)
+            # Combine evidence — keep both signal trails for the audit record.
+            result.evidence = list(result.evidence) + list(llm_result.evidence)
         except Exception as exc:  # noqa: BLE001 — never block init on LLM failure
             print(f"  LLM corpus-origin tier failed ({exc}); using heuristic only.")
 
