@@ -1629,3 +1629,115 @@ def test_merge_tier_fields_no_llm_provider_returns_heuristic_only():
     assert res["agent_persona_names"] == []
     assert res["user_name"] is None
     assert res["primary_platform"] is None
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# External-API privacy warning (issue #24).
+#
+# When mempalace init resolves an LLM provider whose endpoint will send
+# user content off the local machine/network, init MUST print a clear
+# warning naming the provider, stating that MemPalace doesn't control
+# how the provider logs/retains/uses the data, and pointing at --no-llm.
+# Local providers (Ollama on localhost, LM Studio on LAN, etc.) MUST NOT
+# trigger the warning.
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def test_init_prints_privacy_warning_when_provider_is_external(
+    ai_dialogue_corpus: Path, tmp_path: Path, capsys
+):
+    """When cmd_init successfully acquires a provider whose
+    is_external_service is True, output must contain the privacy
+    warning text including the EXTERNAL marker.
+    """
+    from mempalace.cli import cmd_init
+
+    palace = tmp_path / "palace"
+    args = _init_args(ai_dialogue_corpus)  # default = LLM ON
+
+    fake_provider = MagicMock()
+    fake_provider.check_available.return_value = (True, "ok")
+    fake_provider.is_external_service = True
+    fake_provider.classify.return_value = MagicMock(text='{"classifications": []}')
+
+    with (
+        patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
+        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+    ):
+        cmd_init(args)
+
+    out = capsys.readouterr().out
+    assert "EXTERNAL API" in out, (
+        f"Privacy warning must mention 'EXTERNAL API' when provider is external. " f"Got: {out!r}"
+    )
+    assert (
+        "--no-llm" in out
+    ), f"Privacy warning must point users at --no-llm to opt out. Got: {out!r}"
+    # The warning should also tell users MemPalace isn't responsible
+    # for downstream provider behavior.
+    assert (
+        "does not control" in out.lower()
+        or "not responsible" in out.lower()
+        or "logs" in out.lower()
+        or "retains" in out.lower()
+    ), (
+        f"Privacy warning must clarify MemPalace doesn't control how the "
+        f"provider handles the data. Got: {out!r}"
+    )
+
+
+def test_init_no_privacy_warning_when_provider_is_local(
+    ai_dialogue_corpus: Path, tmp_path: Path, capsys
+):
+    """When cmd_init successfully acquires a LOCAL provider (e.g. Ollama
+    on localhost, LM Studio on LAN), the privacy warning MUST NOT fire —
+    nothing is leaving the user's machine/network.
+    """
+    from mempalace.cli import cmd_init
+
+    palace = tmp_path / "palace"
+    args = _init_args(ai_dialogue_corpus)  # default = LLM ON
+
+    fake_provider = MagicMock()
+    fake_provider.check_available.return_value = (True, "ok")
+    fake_provider.is_external_service = False  # Local provider — no warning
+    fake_provider.classify.return_value = MagicMock(text='{"classifications": []}')
+
+    with (
+        patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
+        patch("mempalace.cli.get_provider", return_value=fake_provider),
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+    ):
+        cmd_init(args)
+
+    out = capsys.readouterr().out
+    assert "EXTERNAL API" not in out, (
+        f"Privacy warning fired for a LOCAL provider — should not have. " f"Got: {out!r}"
+    )
+
+
+def test_init_no_privacy_warning_with_no_llm_flag(ai_dialogue_corpus: Path, tmp_path: Path, capsys):
+    """With --no-llm, no provider is acquired at all, so the privacy
+    warning has nothing to fire on. Output must not contain it.
+    """
+    from mempalace.cli import cmd_init
+
+    palace = tmp_path / "palace"
+    args = _init_args(ai_dialogue_corpus, no_llm=True)
+
+    with (
+        patch("mempalace.cli.MempalaceConfig", return_value=_stub_cfg(palace)),
+        patch("mempalace.cli.get_provider") as mock_get,
+        patch("mempalace.cli._maybe_run_mine_after_init"),
+        patch("mempalace.room_detector_local.detect_rooms_local"),
+    ):
+        cmd_init(args)
+
+    mock_get.assert_not_called(), "--no-llm must short-circuit before provider acquisition"
+    out = capsys.readouterr().out
+    assert (
+        "EXTERNAL API" not in out
+    ), f"Privacy warning fired on --no-llm path — should not have. Got: {out!r}"

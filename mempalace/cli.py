@@ -250,6 +250,19 @@ def cmd_init(args):
             if ok:
                 llm_provider = candidate
                 print(f"  LLM enabled: {provider_name}/{provider_model}")
+                # Privacy warning (issue #24): if the configured endpoint
+                # sends data off the user's machine/network, surface that
+                # before init proceeds. URL-based — Ollama on localhost,
+                # LM Studio on LAN, etc. won't trigger; Anthropic /
+                # cloud OpenAI-compat / any non-local endpoint will.
+                if candidate.is_external_service:
+                    print(
+                        f"  ⚠ {provider_name} is an EXTERNAL API. Your folder "
+                        f"content will be sent to the provider during init. "
+                        f"MemPalace does not control how the provider logs, "
+                        f"retains, or uses your data. Pass --no-llm to keep "
+                        f"init fully local."
+                    )
             else:
                 print(
                     f"  No LLM provider reachable ({msg}). "
