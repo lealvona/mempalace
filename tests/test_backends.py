@@ -384,7 +384,6 @@ def test_fix_blob_seq_ids_noop_without_database(tmp_path):
 
 def test_fix_blob_seq_ids_writes_marker_after_blob_path(tmp_path):
     """The .blob_seq_ids_migrated marker is written after a successful BLOB → INTEGER conversion."""
-    from pathlib import Path
     from mempalace.backends.chroma import _BLOB_FIX_MARKER
 
     db_path = tmp_path / "chroma.sqlite3"
@@ -410,7 +409,6 @@ def test_fix_blob_seq_ids_writes_marker_when_already_integer(tmp_path):
     marker on first run too — next ``_fix_blob_seq_ids`` call short-circuits
     before touching the sqlite3 file.
     """
-    from pathlib import Path
     from mempalace.backends.chroma import _BLOB_FIX_MARKER
 
     db_path = tmp_path / "chroma.sqlite3"
@@ -436,7 +434,6 @@ def test_fix_blob_seq_ids_skips_sqlite_when_marker_present(tmp_path):
     PersistentClient call (#1090). Once a palace has been migrated, we
     never want to open it again, even read-only.
     """
-    from pathlib import Path
     from unittest.mock import patch
     from mempalace.backends.chroma import _BLOB_FIX_MARKER
 
