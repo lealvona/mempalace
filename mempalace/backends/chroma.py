@@ -72,6 +72,12 @@ def _segment_appears_healthy(seg_dir: str) -> bool:
     can execute arbitrary code, and the byte-sniff is sufficient to
     distinguish a complete write from truncation, zero-fill, or
     partial-flush corruption.
+
+    Assumes pickle protocol >= 2 (``0x80`` PROTO marker). Matches what
+    chromadb writes today; if a future chromadb version emits protocol
+    0/1 segments, this check would start returning False on healthy
+    files and quarantine_stale_hnsw would conservatively rename them
+    out of the way (lazy rebuild on next open recovers).
     """
     meta_path = os.path.join(seg_dir, "index_metadata.pickle")
     if not os.path.isfile(meta_path):
@@ -621,6 +627,14 @@ class ChromaBackend(BaseBackend):
     # Real runtime drift is still handled — palace-daemon's ``_auto_repair``
     # calls :func:`quarantine_stale_hnsw` directly on observed HNSW errors,
     # which bypasses this gate.
+    #
+    # Thread-safety: this set is mutated without a lock. Two concurrent
+    # ``make_client()`` calls for the same palace can both pass the
+    # membership check and both invoke ``quarantine_stale_hnsw``. That's
+    # safe because the function is idempotent (mtime check + timestamped
+    # rename of distinct directories), so the worst-case race produces
+    # one redundant rename attempt that no-ops. Idempotency is the
+    # safety property; locking would add cost without correctness gain.
     _quarantined_paths: set[str] = set()
 
     @staticmethod
