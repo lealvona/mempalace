@@ -378,3 +378,51 @@ def test_anthropic_provider_default_endpoint_is_external():
         f"Default AnthropicProvider endpoint must be external; got "
         f"is_external_service={p.is_external_service} for endpoint={p.endpoint}"
     )
+
+
+# ── Tailscale CGNAT range (issue #25 follow-up to #24) ──────────────────
+#
+# Tailscale assigns addresses in 100.64.0.0/10 (CGNAT range): first octet
+# always 100, second octet 64-127 inclusive. Users running LM Studio /
+# Ollama / any local LLM accessible via Tailscale would currently
+# (post-#24, pre-#25) get a wrong privacy warning because the heuristic
+# doesn't recognize CGNAT as private. These tests pin the fix.
+
+
+def test_openai_compat_provider_tailscale_cgnat_endpoint_is_local():
+    """Tailscale CGNAT range (100.64.0.0/10) — IPs where the first octet
+    is 100 AND the second octet is 64-127 inclusive — must be classified
+    as local. Tailscale users running LM Studio on their Tailnet should
+    not trigger the external-API warning.
+    """
+    cases = [
+        ("http://100.64.0.1:1234", "start of CGNAT"),
+        ("http://100.100.50.50:1234", "middle of CGNAT (typical Tailscale assignment)"),
+        ("http://100.127.255.254:1234", "near end of CGNAT"),
+    ]
+    for endpoint, label in cases:
+        p = OpenAICompatProvider(model="any", endpoint=endpoint)
+        assert p.is_external_service is False, (
+            f"Tailscale CGNAT address {endpoint} ({label}) must be classified "
+            f"local; got is_external_service={p.is_external_service}"
+        )
+
+
+def test_openai_compat_provider_outside_tailscale_cgnat_is_external():
+    """Addresses in 100.x.x.x that fall OUTSIDE the CGNAT range
+    (100.64.0.0 - 100.127.255.255) are public IPs in regular allocated
+    space and must remain classified as external. Specifically: anything
+    where the second octet is < 64 or > 127.
+    """
+    cases = [
+        ("http://100.0.0.1:1234", "below CGNAT (public)"),
+        ("http://100.63.255.255:1234", "just below CGNAT (boundary)"),
+        ("http://100.128.0.0:1234", "just above CGNAT (boundary)"),
+        ("http://100.255.255.255:1234", "well above CGNAT"),
+    ]
+    for endpoint, label in cases:
+        p = OpenAICompatProvider(model="any", endpoint=endpoint)
+        assert p.is_external_service is True, (
+            f"Address {endpoint} ({label}) is OUTSIDE Tailscale CGNAT and "
+            f"should remain external; got is_external_service={p.is_external_service}"
+        )
