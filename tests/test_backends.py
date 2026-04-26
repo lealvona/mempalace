@@ -393,9 +393,7 @@ _HEALTHY_META = b"\x80\x04" + b"\x00" * 32 + b"\x2e"
 _CORRUPT_META = b"\x00" * 64
 
 
-def _make_palace_with_segment(
-    tmp_path, hnsw_mtime, sqlite_mtime, meta_bytes=_HEALTHY_META
-):
+def _make_palace_with_segment(tmp_path, hnsw_mtime, sqlite_mtime, meta_bytes=_HEALTHY_META):
     """Helper: build a palace dir with one HNSW segment + sqlite at given
     mtimes. ``meta_bytes`` controls whether the segment looks healthy
     (default), corrupt (``_CORRUPT_META``), or has no metadata file at
@@ -544,9 +542,9 @@ def test_make_client_quarantines_only_on_first_call_per_palace(tmp_path, monkeyp
     ChromaBackend.make_client(palace_path)
     ChromaBackend.make_client(palace_path)
 
-    assert calls == [palace_path], (
-        "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
-    )
+    assert calls == [
+        palace_path
+    ], "quarantine_stale_hnsw should fire once per palace per process, not on every reconnect"
 
 
 def test_make_client_quarantines_each_palace_independently(tmp_path, monkeypatch):
@@ -625,5 +623,3 @@ def test_get_collection_applies_retrofit_on_existing_palace(tmp_path):
     )
 
     assert wrapper._collection.configuration_json["hnsw"]["num_threads"] == 1
-
-
