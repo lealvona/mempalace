@@ -57,7 +57,12 @@ from .config import (  # noqa: E402
     sanitize_content,
 )
 from .version import __version__  # noqa: E402
-from .backends.chroma import ChromaBackend, ChromaCollection, _pin_hnsw_threads  # noqa: E402
+from .backends.chroma import (  # noqa: E402
+    ChromaBackend,
+    ChromaCollection,
+    _pin_hnsw_threads,
+    hnsw_capacity_status,
+)
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories  # noqa: E402
 from .palace_graph import (  # noqa: E402
@@ -107,6 +112,52 @@ _client_cache = None
 _collection_cache = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
 _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
+
+# ── Vector-search disabled flag (#1222) ──────────────────────────────────
+# Set when ``hnsw_capacity_status`` reports a divergence between sqlite
+# and the HNSW segment large enough that chromadb would segfault on
+# segment load. While this is set, vector-shaped tools (``search``,
+# ``check_duplicate``) route to the sqlite-only BM25 fallback in
+# :func:`mempalace.searcher._bm25_only_via_sqlite`. Cleared after a
+# successful repair via :func:`tool_reconnect` (which re-runs the probe).
+_vector_disabled = False
+_vector_disabled_reason = ""
+_vector_capacity_status: dict | None = None
+
+
+def _refresh_vector_disabled_flag() -> None:
+    """Re-run the HNSW capacity probe and update the module-level flag.
+
+    Called from :func:`_get_client` whenever the client cache is rebuilt
+    (first open or palace replacement). Cheap — pure sqlite + pickle
+    read, no chromadb interaction. Never raises: a probe that crashes
+    would defeat the point.
+    """
+    global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
+    try:
+        info = hnsw_capacity_status(_config.palace_path, "mempalace_drawers")
+    except Exception:
+        logger.debug("HNSW capacity probe raised", exc_info=True)
+        return
+    _vector_capacity_status = info
+    if info.get("diverged"):
+        if not _vector_disabled:
+            logger.warning(
+                "HNSW capacity divergence detected (%s) — routing search to "
+                "BM25-only sqlite fallback. Run `mempalace repair rebuild` to restore "
+                "vector search.",
+                info.get("message", "unknown"),
+            )
+        _vector_disabled = True
+        _vector_disabled_reason = info.get("message", "")
+    else:
+        if _vector_disabled:
+            logger.info(
+                "HNSW capacity within tolerance (%s) — vector search re-enabled",
+                info.get("message", ""),
+            )
+        _vector_disabled = False
+        _vector_disabled_reason = ""
 
 
 # ==================== WRITE-AHEAD LOG ====================
@@ -202,6 +253,11 @@ def _get_client():
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
 
     if _client_cache is None or inode_changed or mtime_changed:
+        # Run the HNSW capacity probe BEFORE chromadb opens the segment —
+        # if the index is severely undersized, segment load can segfault
+        # the whole MCP server (#1222). The probe is pure sqlite +
+        # metadata-pickle read; never touches the HNSW binary files.
+        _refresh_vector_disabled_flag()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
         _metadata_cache = None
@@ -322,6 +378,17 @@ def tool_status():
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
     }
+    if _vector_disabled:
+        # Surface the #1222 fallback state so the AI knows search results
+        # are BM25-only and recommends the operator run repair.
+        result["vector_disabled"] = True
+        result["vector_disabled_reason"] = _vector_disabled_reason
+        if _vector_capacity_status:
+            result["hnsw_capacity"] = {
+                "sqlite_count": _vector_capacity_status.get("sqlite_count"),
+                "hnsw_count": _vector_capacity_status.get("hnsw_count"),
+                "divergence": _vector_capacity_status.get("divergence"),
+            }
     try:
         all_meta = _get_cached_metadata(col)
         for m in all_meta:
@@ -456,6 +523,9 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
+    # Ensure the capacity probe has been run at least once before we
+    # decide which path to take — _get_client triggers it on first open.
+    _get_client()
     result = search_memories(
         sanitized["clean_query"],
         palace_path=_config.palace_path,
@@ -463,7 +533,11 @@ def tool_search(
         room=room,
         n_results=limit,
         max_distance=dist,
+        vector_disabled=_vector_disabled,
     )
+    if _vector_disabled:
+        result["vector_disabled"] = True
+        result["vector_disabled_reason"] = _vector_disabled_reason
     # Attach sanitizer metadata for transparency
     if sanitized["was_sanitized"]:
         result["query_sanitized"] = True
@@ -482,6 +556,21 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
     col = _get_collection()
     if not col:
         return _no_palace()
+    if _vector_disabled:
+        # Without a usable HNSW we can't compute cosine similarity for
+        # near-duplicate detection. Report the limitation rather than
+        # silently returning "not a duplicate" — false negatives here
+        # would let the AI re-file content the palace already holds.
+        return {
+            "is_duplicate": False,
+            "matches": [],
+            "vector_disabled": True,
+            "vector_disabled_reason": _vector_disabled_reason,
+            "hint": (
+                "duplicate detection requires vector search; run "
+                "`mempalace repair rebuild` to restore"
+            ),
+        }
     try:
         results = col.query(
             query_texts=[content],
@@ -1150,10 +1239,22 @@ def tool_reconnect():
     Use after external scripts or CLI commands modify the palace database
     directly, which can leave the in-memory HNSW index stale.
     """
-    global _collection_cache, _palace_db_inode, _palace_db_mtime
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _palace_db_inode, \
+        _palace_db_mtime, \
+        _vector_disabled, \
+        _vector_disabled_reason
+    _client_cache = None
     _collection_cache = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
+    # Force probe re-run on next _get_client by clearing the flag now;
+    # _refresh_vector_disabled_flag will re-set it if the divergence
+    # still applies after the reconnect.
+    _vector_disabled = False
+    _vector_disabled_reason = ""
     try:
         col = _get_collection()
         if col is None:
@@ -1161,8 +1262,15 @@ def tool_reconnect():
                 "success": False,
                 "message": "No palace found after reconnect",
                 "drawers": 0,
+                "vector_disabled": _vector_disabled,
             }
-        return {"success": True, "message": "Reconnected to palace", "drawers": col.count()}
+        return {
+            "success": True,
+            "message": "Reconnected to palace",
+            "drawers": col.count(),
+            "vector_disabled": _vector_disabled,
+            "vector_disabled_reason": _vector_disabled_reason,
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1726,6 +1834,10 @@ def _restore_stdout():
 def main():
     _restore_stdout()
     logger.info("MemPalace MCP Server starting...")
+    # Pre-flight: probe HNSW capacity before any tool call so the warning
+    # is visible at startup rather than on first use (#1222). Pure
+    # filesystem read; never opens a chromadb client.
+    _refresh_vector_disabled_flag()
     while True:
         try:
             line = sys.stdin.readline()
