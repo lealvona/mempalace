@@ -410,6 +410,7 @@ def cmd_repair(args):
     import shutil
     from .backends.chroma import ChromaBackend
     from .migrate import confirm_destructive_action, contains_palace_database
+    from .repair import TruncationDetected, check_extraction_safety
 
     palace_path = os.path.abspath(
         os.path.expanduser(args.palace) if args.palace else MempalaceConfig().palace_path
@@ -465,6 +466,23 @@ def cmd_repair(args):
         all_metas.extend(batch["metadatas"])
         offset += len(batch["ids"])
     print(f"  Extracted {len(all_ids)} drawers")
+
+    # ── #1208 guard ──────────────────────────────────────────────────
+    # Cross-check against the SQLite ground truth before doing anything
+    # destructive. Catches the user-reported case where chromadb's
+    # collection-layer get() silently caps at 10,000 rows even on much
+    # larger palaces (e.g. after manual HNSW quarantine). Override with
+    # --confirm-truncation-ok only after independently verifying the
+    # extraction count is real.
+    try:
+        check_extraction_safety(
+            palace_path,
+            len(all_ids),
+            confirm_truncation_ok=getattr(args, "confirm_truncation_ok", False),
+        )
+    except TruncationDetected as e:
+        print(e.message)
+        return
 
     # Backup and rebuild
     palace_path = os.path.normpath(palace_path)
@@ -868,10 +886,23 @@ def main():
         instructions_sub.add_parser(instr_name, help=f"Output {instr_name} instructions")
 
     # repair
-    sub.add_parser(
+    p_repair = sub.add_parser(
         "repair",
         help="Rebuild palace vector index from stored data (fixes segfaults after corruption)",
-    ).add_argument("--yes", action="store_true", help="Skip confirmation for destructive changes")
+    )
+    p_repair.add_argument(
+        "--yes", action="store_true", help="Skip confirmation for destructive changes"
+    )
+    p_repair.add_argument(
+        "--confirm-truncation-ok",
+        action="store_true",
+        help=(
+            "Override the #1208 safety guard. Required when chromadb's collection-layer "
+            "extraction returns exactly 10,000 drawers and the SQLite ground-truth check "
+            "either matches or can't be read. Use only after independently confirming "
+            "the palace really contains that count."
+        ),
+    )
 
     # mcp
     sub.add_parser(
