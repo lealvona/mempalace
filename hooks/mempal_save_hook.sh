@@ -83,9 +83,11 @@ fi
 INPUT=$(cat)
 
 # Parse all fields in a single Python call (3x faster than separate invocations)
-# SECURITY: All values are sanitized before being interpolated into shell assignments.
-# stop_hook_active is coerced to a strict True/False to prevent command injection via eval.
-eval $(echo "$INPUT" | "$MEMPAL_PYTHON_BIN" -c "
+# without invoking ``eval`` on generated code: Python prints one sanitized
+# value per line, the shell reads them via ``mapfile`` and does plain
+# variable assignment — same data, smaller blast radius if the sanitizer
+# is ever bypassed (#1231 review).
+mapfile -t _mempal_parsed < <(echo "$INPUT" | "$MEMPAL_PYTHON_BIN" -c "
 import sys, json, re
 data = json.load(sys.stdin)
 sid = data.get('session_id', 'unknown')
@@ -95,13 +97,35 @@ tp = data.get('transcript_path', '')
 safe = lambda s: re.sub(r'[^a-zA-Z0-9_/.\-~]', '', str(s))
 # Coerce stop_hook_active to strict boolean string
 sha = 'True' if sha_raw is True or str(sha_raw).lower() in ('true', '1', 'yes') else 'False'
-print(f'SESSION_ID=\"{safe(sid)}\"')
-print(f'STOP_HOOK_ACTIVE=\"{sha}\"')
-print(f'TRANSCRIPT_PATH=\"{safe(tp)}\"')
+print(safe(sid))
+print(sha)
+print(safe(tp))
 " 2>/dev/null)
+SESSION_ID="${_mempal_parsed[0]:-unknown}"
+STOP_HOOK_ACTIVE="${_mempal_parsed[1]:-False}"
+TRANSCRIPT_PATH="${_mempal_parsed[2]:-}"
 
 # Expand ~ in path
 TRANSCRIPT_PATH="${TRANSCRIPT_PATH/#\~/$HOME}"
+
+# Validate that TRANSCRIPT_PATH looks like a transcript file:
+#   - non-empty
+#   - .jsonl or .json suffix
+#   - no traversal segments (.. components)
+# Mirrors mempalace.hooks_cli._validate_transcript_path so the shell hook
+# rejects the same shapes the Python hook rejects (#1231 review).
+is_valid_transcript_path() {
+    local path="$1"
+    [ -n "$path" ] || return 1
+    case "$path" in
+        *.json|*.jsonl) ;;
+        *) return 1 ;;
+    esac
+    case "/$path/" in
+        */../*) return 1 ;;
+    esac
+    return 0
+}
 
 # If we're already in a save cycle, let the AI stop normally
 # This is the infinite-loop prevention: block once → AI saves → tries to stop again → we let it through
@@ -165,9 +189,12 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
     #      (code, notes, docs)
     # MEMPAL_DIR is *additive*, not an override: a user with MEMPAL_DIR
     # pointed at their project still gets the active conversation mined.
-    if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
+    if is_valid_transcript_path "$TRANSCRIPT_PATH" && [ -f "$TRANSCRIPT_PATH" ]; then
         mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
             >> "$STATE_DIR/hook.log" 2>&1 &
+    elif [ -n "$TRANSCRIPT_PATH" ]; then
+        echo "[$(date '+%H:%M:%S')] Skipping invalid transcript path: $TRANSCRIPT_PATH" \
+            >> "$STATE_DIR/hook.log"
     fi
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
         mempalace mine "$MEMPAL_DIR" --mode projects \

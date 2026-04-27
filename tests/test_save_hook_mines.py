@@ -61,3 +61,65 @@ class TestSaveHookAutoMines:
                 'MEMPAL_DIR defaults to "" which silently disables mining. '
                 "Either set a default path or add transcript-based mining."
             )
+
+
+class TestShellHookTranscriptValidation:
+    """Both shell hooks must validate transcript paths before mining them.
+
+    Mirrors mempalace.hooks_cli._validate_transcript_path so unsafe paths
+    (no extension, traversal segments) are rejected at the shell layer
+    too — added in #1231 review (Copilot #7, #8).
+    """
+
+    @staticmethod
+    def _hook_src(name: str) -> str:
+        path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "hooks", name)
+        return open(path).read()
+
+    @staticmethod
+    def _strip_comments(src: str) -> str:
+        return "\n".join(line for line in src.splitlines() if not line.lstrip().startswith("#"))
+
+    def test_save_hook_defines_and_uses_validator(self):
+        src = self._strip_comments(self._hook_src("mempal_save_hook.sh"))
+        assert "is_valid_transcript_path() {" in src, "validator function must be defined"
+        assert (
+            'is_valid_transcript_path "$TRANSCRIPT_PATH"' in src
+        ), "validator must be invoked against TRANSCRIPT_PATH before mining"
+
+    def test_precompact_hook_defines_and_uses_validator(self):
+        src = self._strip_comments(self._hook_src("mempal_precompact_hook.sh"))
+        assert "is_valid_transcript_path() {" in src, "validator function must be defined"
+        assert (
+            'is_valid_transcript_path "$TRANSCRIPT_PATH"' in src
+        ), "validator must be invoked against TRANSCRIPT_PATH before mining"
+
+    def test_validators_run_via_bash(self, tmp_path):
+        """Source the validator out of each hook and exercise it directly."""
+        import subprocess
+
+        for name in ("mempal_save_hook.sh", "mempal_precompact_hook.sh"):
+            src = self._hook_src(name)
+            # Extract just the function definition (first occurrence).
+            start = src.index("is_valid_transcript_path() {")
+            end = src.index("\n}\n", start) + 2
+            func_src = src[start:end]
+            script = tmp_path / "v.sh"
+            script.write_text(
+                f"{func_src}\n" 'is_valid_transcript_path "$1" && echo OK || echo NO\n'
+            )
+
+            def run(arg: str) -> str:
+                return subprocess.run(
+                    ["bash", str(script), arg],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                ).stdout.strip()
+
+            assert run("/tmp/sessions/abc.jsonl") == "OK"
+            assert run("/tmp/sessions/abc.json") == "OK"
+            assert run("") == "NO"
+            assert run("/tmp/notes.txt") == "NO"
+            assert run("../etc/passwd.jsonl") == "NO"
+            assert run("/tmp/../etc/t.jsonl") == "NO"
