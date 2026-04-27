@@ -197,16 +197,26 @@ def _output(data: dict):
     sys.stdout.buffer.flush()
 
 
-def _get_mine_dir(transcript_path: str = "") -> str:
-    """Determine directory to mine from MEMPAL_DIR or transcript path."""
+def _get_mine_dir(transcript_path: str = "") -> tuple[str, str]:
+    """Determine directory to mine and the miner mode to use.
+
+    Returns ``(dir, mode)`` where ``mode`` is ``"projects"`` or ``"convos"``.
+    Empty ``dir`` means no ingest should run.
+
+    MEMPAL_DIR is treated as a project directory ("projects" mode). The
+    transcript-path fallback resolves to the parent of a Claude Code
+    session JSONL, which must be mined with the conversation miner —
+    running the projects miner there ingests JSONL as if it were source
+    code.
+    """
     mempal_dir = os.environ.get("MEMPAL_DIR", "")
     if mempal_dir and os.path.isdir(mempal_dir):
-        return mempal_dir
+        return mempal_dir, "projects"
     if transcript_path:
         path = Path(transcript_path).expanduser()
         if path.is_file():
-            return str(path.parent)
-    return ""
+            return str(path.parent), "convos"
+    return "", "projects"
 
 
 _MINE_PID_FILE = STATE_DIR / "mine.pid"
@@ -265,21 +275,21 @@ def _spawn_mine(cmd: list) -> None:
 
 def _maybe_auto_ingest(transcript_path: str = ""):
     """Run mempalace mine in background if a mine directory is available."""
-    mine_dir = _get_mine_dir(transcript_path)
+    mine_dir, mode = _get_mine_dir(transcript_path)
     if not mine_dir:
         return
     if _mine_already_running():
         _log("Skipping auto-ingest: mine already running")
         return
     try:
-        _spawn_mine([sys.executable, "-m", "mempalace", "mine", mine_dir])
+        _spawn_mine([sys.executable, "-m", "mempalace", "mine", mine_dir, "--mode", mode])
     except OSError:
         pass
 
 
 def _mine_sync(transcript_path: str = ""):
     """Run mempalace mine synchronously (for precompact -- data must land first)."""
-    mine_dir = _get_mine_dir(transcript_path)
+    mine_dir, mode = _get_mine_dir(transcript_path)
     if not mine_dir:
         return
     try:
@@ -287,7 +297,7 @@ def _mine_sync(transcript_path: str = ""):
         log_path = STATE_DIR / "hook.log"
         with open(log_path, "a") as log_f:
             subprocess.run(
-                [sys.executable, "-m", "mempalace", "mine", mine_dir],
+                [sys.executable, "-m", "mempalace", "mine", mine_dir, "--mode", mode],
                 stdout=log_f,
                 stderr=log_f,
                 timeout=60,

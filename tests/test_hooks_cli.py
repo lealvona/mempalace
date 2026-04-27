@@ -17,6 +17,7 @@ from mempalace.hooks_cli import (
     _maybe_auto_ingest,
     _mempalace_python,
     _mine_already_running,
+    _mine_sync,
     _parse_harness_input,
     _sanitize_session_id,
     _validate_transcript_path,
@@ -434,7 +435,7 @@ def test_maybe_auto_ingest_no_env(tmp_path):
 
 
 def test_maybe_auto_ingest_with_env(tmp_path):
-    """With MEMPAL_DIR set to a valid directory, spawns subprocess."""
+    """With MEMPAL_DIR set, spawns mine in projects mode against that dir."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
@@ -443,10 +444,14 @@ def test_maybe_auto_ingest_with_env(tmp_path):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                     _maybe_auto_ingest()
                     mock_popen.assert_called_once()
+                    cmd = mock_popen.call_args[0][0]
+                    assert "mine" in cmd
+                    assert str(mempal_dir) in cmd
+                    assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
 def test_maybe_auto_ingest_with_transcript(tmp_path):
-    """Falls back to transcript directory when MEMPAL_DIR is not set."""
+    """Transcript fallback spawns mine in convos mode against the JSONL parent."""
     transcript = tmp_path / "t.jsonl"
     transcript.write_text("")
     with patch.dict("os.environ", {}, clear=True):
@@ -455,6 +460,38 @@ def test_maybe_auto_ingest_with_transcript(tmp_path):
                 with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
                     _maybe_auto_ingest(str(transcript))
                     mock_popen.assert_called_once()
+                    cmd = mock_popen.call_args[0][0]
+                    assert "mine" in cmd
+                    assert str(tmp_path) in cmd
+                    assert cmd[cmd.index("--mode") + 1] == "convos"
+
+
+def test_mine_sync_with_transcript_uses_convos_mode(tmp_path):
+    """Precompact sync path also picks convos mode for JSONL transcripts."""
+    transcript = tmp_path / "t.jsonl"
+    transcript.write_text("")
+    with patch.dict("os.environ", {}, clear=True):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                _mine_sync(str(transcript))
+                mock_run.assert_called_once()
+                cmd = mock_run.call_args[0][0]
+                assert "mine" in cmd
+                assert str(tmp_path) in cmd
+                assert cmd[cmd.index("--mode") + 1] == "convos"
+
+
+def test_mine_sync_with_env_uses_projects_mode(tmp_path):
+    """Precompact sync path uses projects mode when MEMPAL_DIR is set."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                _mine_sync()
+                mock_run.assert_called_once()
+                cmd = mock_run.call_args[0][0]
+                assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
 def test_maybe_auto_ingest_oserror(tmp_path):
@@ -517,27 +554,27 @@ def test_mine_already_running_corrupt_file(tmp_path):
 
 
 def test_get_mine_dir_mempal_dir(tmp_path):
-    """MEMPAL_DIR takes priority over transcript_path."""
+    """MEMPAL_DIR takes priority and is treated as projects mode."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     transcript = tmp_path / "t.jsonl"
     transcript.write_text("")
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
-        assert _get_mine_dir(str(transcript)) == str(mempal_dir)
+        assert _get_mine_dir(str(transcript)) == (str(mempal_dir), "projects")
 
 
 def test_get_mine_dir_transcript_fallback(tmp_path):
-    """Falls back to transcript parent dir when MEMPAL_DIR is not set."""
+    """Transcript fallback resolves to its parent dir in convos mode."""
     transcript = tmp_path / "t.jsonl"
     transcript.write_text("")
     with patch.dict("os.environ", {}, clear=True):
-        assert _get_mine_dir(str(transcript)) == str(tmp_path)
+        assert _get_mine_dir(str(transcript)) == (str(tmp_path), "convos")
 
 
 def test_get_mine_dir_empty():
-    """Returns empty string when nothing is available."""
+    """Returns empty dir when nothing is available."""
     with patch.dict("os.environ", {}, clear=True):
-        assert _get_mine_dir("") == ""
+        assert _get_mine_dir("") == ("", "projects")
 
 
 # --- _parse_harness_input ---
@@ -669,9 +706,10 @@ def test_precompact_mines_transcript_dir(tmp_path, monkeypatch):
         )
     assert result == {}
     mock_run.assert_called_once()
-    # Verify mine dir is the transcript's parent
+    # Mine dir is the transcript's parent and mode is convos for JSONL.
     call_args = mock_run.call_args[0][0]
-    assert str(tmp_path) in call_args[-1]
+    assert str(tmp_path) in call_args
+    assert call_args[call_args.index("--mode") + 1] == "convos"
 
 
 # --- run_hook ---
