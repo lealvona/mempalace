@@ -15,6 +15,11 @@ Enables queries like:
 No external graph DB needed — built from ChromaDB metadata.
 """
 
+# PEP 604 (``str | None``) needs 3.10+ at runtime; the project still
+# supports 3.9, so defer annotation evaluation to keep the union syntax
+# working on the older interpreter.
+from __future__ import annotations
+
 import hashlib
 import json
 import logging
