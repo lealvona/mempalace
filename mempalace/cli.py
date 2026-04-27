@@ -276,6 +276,33 @@ def cmd_init(args):
                         f"retains, or uses your data. Pass --no-llm to keep "
                         f"init fully local."
                     )
+                    # Consent gate (issue #26): block init when the api_key
+                    # was acquired via env-fallback (stray credential in
+                    # shell env). Explicit --llm-api-key (api_key_source ==
+                    # "flag") means the user already opted in.
+                    # --accept-external-llm bypasses for CI / non-interactive.
+                    api_key_source = getattr(candidate, "api_key_source", None)
+                    accept_flag = getattr(args, "accept_external_llm", False)
+                    if api_key_source == "env" and not accept_flag:
+                        try:
+                            answer = (
+                                input(
+                                    "  Your API key was loaded from the environment "
+                                    "(not passed via --llm-api-key). Continue with "
+                                    "external LLM? [y/N] "
+                                )
+                                .strip()
+                                .lower()
+                            )
+                        except EOFError:
+                            answer = ""
+                        if answer != "y":
+                            print(
+                                "  Declined — falling back to heuristics-only. "
+                                "Pass --llm-api-key explicitly or "
+                                "--accept-external-llm to skip this prompt."
+                            )
+                            llm_provider = None
             else:
                 print(
                     f"  No LLM provider reachable ({msg}). "
@@ -992,6 +1019,16 @@ def main():
         help=(
             "API key for the provider. For anthropic, defaults to $ANTHROPIC_API_KEY; "
             "for openai-compat, defaults to $OPENAI_API_KEY."
+        ),
+    )
+    p_init.add_argument(
+        "--accept-external-llm",
+        action="store_true",
+        help=(
+            "Bypass the interactive consent prompt that fires when an external "
+            "LLM is configured via an environment-variable API key (issue #26). "
+            "Use this in CI / non-interactive runs where you've already decided "
+            "the external send is acceptable."
         ),
     )
 
