@@ -163,6 +163,11 @@ def test_cmd_init_normalizes_wing_name_for_topics_registry(mock_config_cls, tmp_
         patch("mempalace.room_detector_local.detect_rooms_local"),
         patch("builtins.open", MagicMock()),
         patch("mempalace.cli._maybe_run_mine_after_init"),
+        # Pass-zero corpus-origin detection runs unconditionally inside
+        # cmd_init now (#1221 / #1223). It accesses MempalaceConfig fields
+        # that don't survive MagicMock stringification, so stub it out —
+        # this test only cares about the wing-slug write to the registry.
+        patch("mempalace.cli._run_pass_zero", return_value=None),
     ):
         mock_register.return_value = "/tmp/known_entities.json"
         cmd_init(args)
