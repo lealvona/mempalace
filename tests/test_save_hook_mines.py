@@ -9,6 +9,9 @@ Written BEFORE the fix.
 """
 
 import os
+import sys
+
+import pytest
 
 
 class TestSaveHookAutoMines:
@@ -94,6 +97,10 @@ class TestShellHookTranscriptValidation:
             'is_valid_transcript_path "$TRANSCRIPT_PATH"' in src
         ), "validator must be invoked against TRANSCRIPT_PATH before mining"
 
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason="shell hooks are POSIX-only; Windows CI bash maps to wsl.exe with no distro",
+    )
     def test_validators_run_via_bash(self, tmp_path):
         """Source the validator out of each hook and exercise it directly."""
         import subprocess
