@@ -594,6 +594,25 @@ def test_gemini_jsonl_does_not_match_codex():
     assert result is None
 
 
+def test_gemini_jsonl_messages_before_session_metadata_discarded():
+    """user/gemini turns that appear before the session_metadata sentinel must
+    be silently discarded, not counted as conversational messages.  Only turns
+    after the sentinel contribute to the transcript."""
+    lines = [
+        json.dumps({"type": "user", "content": [{"text": "preamble Q"}]}),
+        json.dumps({"type": "gemini", "content": [{"text": "preamble A"}]}),
+        json.dumps({"type": "session_metadata", "sessionId": "s"}),
+        json.dumps({"type": "user", "content": [{"text": "real Q"}]}),
+        json.dumps({"type": "gemini", "content": [{"text": "real A"}]}),
+    ]
+    result = _try_gemini_jsonl("\n".join(lines))
+    assert result is not None
+    assert "preamble Q" not in result
+    assert "preamble A" not in result
+    assert "> real Q" in result
+    assert "real A" in result
+
+
 # ── _try_claude_ai_json ───────────────────────────────────────────────
 
 

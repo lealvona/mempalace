@@ -296,9 +296,12 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
 
     Detection requires a ``session_metadata`` record so this parser does
     not false-positive against Claude Code or Codex JSONL passed through
-    the dispatch chain. ``message_update`` entries are skipped — they
-    have no message text. Multiple text blocks within a single message's
-    content array are concatenated in order, separated by newlines.
+    the dispatch chain. Any ``user``/``gemini`` lines that appear before
+    ``session_metadata`` are discarded — they are treated as preamble
+    noise, not conversational turns. ``message_update`` entries are
+    skipped — they have no message text. Multiple text blocks within a
+    single message's content array are concatenated in order, separated
+    by newlines.
     """
     lines = [line.strip() for line in content.strip().split("\n") if line.strip()]
     messages = []
@@ -314,6 +317,11 @@ def _try_gemini_jsonl(content: str) -> Optional[str]:
         entry_type = entry.get("type", "")
         if entry_type == "session_metadata":
             has_session_metadata = True
+            continue
+
+        # Discard everything (including user/gemini turns) until the
+        # session_metadata sentinel has been seen.
+        if not has_session_metadata:
             continue
 
         if entry_type not in ("user", "gemini"):
