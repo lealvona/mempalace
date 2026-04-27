@@ -427,20 +427,48 @@ def _bm25_only_via_sqlite(
         if not candidate_ids:
             # No FTS hits (or no usable tokens) — pull the most recent
             # rows for the drawers segment so we can BM25-rank something
-            # rather than return empty-handed.
-            rows = conn.execute(
-                """
-                SELECT e.id
-                FROM embeddings e
-                JOIN segments s ON e.segment_id = s.id
-                JOIN collections c ON s.collection = c.id
-                WHERE c.name = 'mempalace_drawers'
-                ORDER BY e.created_at DESC
-                LIMIT ?
-                """,
-                (max_candidates,),
-            ).fetchall()
-            candidate_ids = [r[0] for r in rows]
+            # rather than return empty-handed. Wrapped in try/except
+            # because the schema may differ on legacy palaces (older
+            # chromadb without ``created_at``, missing ``segments``
+            # rows after partial restore, etc.); on schema mismatch we
+            # fall back to ordering by primary-key id and finally to an
+            # empty result rather than letting search raise.
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT e.id
+                    FROM embeddings e
+                    JOIN segments s ON e.segment_id = s.id
+                    JOIN collections c ON s.collection = c.id
+                    WHERE c.name = 'mempalace_drawers'
+                    ORDER BY e.created_at DESC
+                    LIMIT ?
+                    """,
+                    (max_candidates,),
+                ).fetchall()
+                candidate_ids = [r[0] for r in rows]
+            except sqlite3.Error:
+                logger.debug(
+                    "recency-window query failed; trying id-ordered fallback",
+                    exc_info=True,
+                )
+                try:
+                    rows = conn.execute(
+                        """
+                        SELECT e.id
+                        FROM embeddings e
+                        JOIN segments s ON e.segment_id = s.id
+                        JOIN collections c ON s.collection = c.id
+                        WHERE c.name = 'mempalace_drawers'
+                        ORDER BY e.id DESC
+                        LIMIT ?
+                        """,
+                        (max_candidates,),
+                    ).fetchall()
+                    candidate_ids = [r[0] for r in rows]
+                except sqlite3.Error:
+                    logger.debug("id-ordered fallback also failed", exc_info=True)
+                    candidate_ids = []
 
         if not candidate_ids:
             return {

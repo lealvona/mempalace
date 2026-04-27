@@ -122,7 +122,10 @@ _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
 # successful repair via :func:`tool_reconnect` (which re-runs the probe).
 _vector_disabled = False
 _vector_disabled_reason = ""
-_vector_capacity_status: dict | None = None
+# Optional[dict] (not ``dict | None``) keeps Python 3.9 import-time
+# parsing happy — PEP 604 unions in annotations only became unconditional
+# at module-eval time in 3.10.
+_vector_capacity_status = None  # type: Optional[dict]
 
 
 def _refresh_vector_disabled_flag() -> None:
@@ -144,7 +147,7 @@ def _refresh_vector_disabled_flag() -> None:
         if not _vector_disabled:
             logger.warning(
                 "HNSW capacity divergence detected (%s) — routing search to "
-                "BM25-only sqlite fallback. Run `mempalace repair rebuild` to restore "
+                "BM25-only sqlite fallback. Run `mempalace repair` to restore "
                 "vector search.",
                 info.get("message", "unknown"),
             )
@@ -359,11 +362,91 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
 # ==================== READ TOOLS ====================
 
 
+def _tool_status_via_sqlite() -> dict:
+    """Pure-sqlite status reader for the #1222 fallback path.
+
+    When the HNSW capacity probe detects divergence, opening the chromadb
+    persistent client can segfault. This reader pulls the same wing/room
+    breakdown directly from ``embedding_metadata`` so the operator still
+    gets a working status response — and crucially the
+    ``vector_disabled`` flag — without us touching the vector segment.
+    """
+    import sqlite3 as _sqlite3
+
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return _no_palace()
+
+    wings: dict = {}
+    rooms: dict = {}
+    total = 0
+    try:
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = 'mempalace_drawers'
+                """
+            ).fetchone()
+            total = int(row[0]) if row and row[0] is not None else 0
+            for key, target in (("wing", wings), ("room", rooms)):
+                for value, count in conn.execute(
+                    """
+                    SELECT em.string_value, COUNT(*)
+                    FROM embedding_metadata em
+                    JOIN embeddings e ON em.id = e.id
+                    JOIN segments s ON e.segment_id = s.id
+                    JOIN collections c ON s.collection = c.id
+                    WHERE c.name = 'mempalace_drawers'
+                      AND em.key = ?
+                      AND em.string_value IS NOT NULL
+                    GROUP BY em.string_value
+                    """,
+                    (key,),
+                ):
+                    target[value] = count
+        finally:
+            conn.close()
+    except _sqlite3.Error:
+        logger.exception("tool_status sqlite fallback read failed")
+
+    result = {
+        "total_drawers": total,
+        "wings": wings,
+        "rooms": rooms,
+        "palace_path": _config.palace_path,
+        "protocol": PALACE_PROTOCOL,
+        "aaak_dialect": AAAK_SPEC,
+        "vector_disabled": True,
+        "vector_disabled_reason": _vector_disabled_reason,
+    }
+    if _vector_capacity_status:
+        result["hnsw_capacity"] = {
+            "sqlite_count": _vector_capacity_status.get("sqlite_count"),
+            "hnsw_count": _vector_capacity_status.get("hnsw_count"),
+            "divergence": _vector_capacity_status.get("divergence"),
+        }
+    return result
+
+
 def tool_status():
+    # Run the safe sqlite/pickle probe before we touch chromadb. In the
+    # #1222 failure mode, opening the persistent client to call .count()
+    # can segfault — short-circuit to a pure-sqlite path when divergence
+    # is detected so status stays reachable.
+    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    _refresh_vector_disabled_flag()
+
+    if _vector_disabled:
+        return _tool_status_via_sqlite()
+
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
-    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
     col = _get_collection(create=db_exists)
     if not col:
         return _no_palace()
@@ -378,17 +461,6 @@ def tool_status():
         "protocol": PALACE_PROTOCOL,
         "aaak_dialect": AAAK_SPEC,
     }
-    if _vector_disabled:
-        # Surface the #1222 fallback state so the AI knows search results
-        # are BM25-only and recommends the operator run repair.
-        result["vector_disabled"] = True
-        result["vector_disabled_reason"] = _vector_disabled_reason
-        if _vector_capacity_status:
-            result["hnsw_capacity"] = {
-                "sqlite_count": _vector_capacity_status.get("sqlite_count"),
-                "hnsw_count": _vector_capacity_status.get("hnsw_count"),
-                "divergence": _vector_capacity_status.get("divergence"),
-            }
     try:
         all_meta = _get_cached_metadata(col)
         for m in all_meta:
@@ -523,9 +595,11 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
-    # Ensure the capacity probe has been run at least once before we
-    # decide which path to take — _get_client triggers it on first open.
-    _get_client()
+    # Ensure the vector-disabled probe has been run via the safe
+    # sqlite/pickle path before we touch chromadb. Calling _get_client()
+    # here would defeat the fallback — it constructs a PersistentClient
+    # which can segfault on segment load in the #1222 failure mode.
+    _refresh_vector_disabled_flag()
     result = search_memories(
         sanitized["clean_query"],
         palace_path=_config.palace_path,
@@ -567,8 +641,7 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
             "vector_disabled": True,
             "vector_disabled_reason": _vector_disabled_reason,
             "hint": (
-                "duplicate detection requires vector search; run "
-                "`mempalace repair rebuild` to restore"
+                "duplicate detection requires vector search; run " "`mempalace repair` to restore"
             ),
         }
     try:

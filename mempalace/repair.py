@@ -440,7 +440,7 @@ def status(palace_path=None) -> dict:
     at a stale ``max_elements`` while sqlite keeps accumulating rows.
     Once the divergence is large enough, every tool call segfaults when
     chromadb tries to load the undersized HNSW. Running ``mempalace
-    repair status`` *before* opening the segment lets the operator
+    repair-status`` *before* opening the segment lets the operator
     discover the problem without crashing the MCP server.
 
     The check itself never opens a chromadb client and never imports
@@ -481,7 +481,7 @@ def status(palace_path=None) -> dict:
             print(f"    note:           {info['message']}")
 
     if drawers["diverged"] or closets["diverged"]:
-        print("\n  Recommended: run `mempalace repair rebuild` to rebuild the index.")
+        print("\n  Recommended: run `mempalace repair` to rebuild the index.")
     print()
     return {"drawers": drawers, "closets": closets}
 
