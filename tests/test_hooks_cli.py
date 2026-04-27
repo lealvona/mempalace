@@ -12,7 +12,7 @@ from mempalace.hooks_cli import (
     SAVE_INTERVAL,
     _count_human_messages,
     _extract_recent_messages,
-    _get_mine_dir,
+    _get_mine_targets,
     _log,
     _maybe_auto_ingest,
     _mempalace_python,
@@ -494,6 +494,43 @@ def test_mine_sync_with_env_uses_projects_mode(tmp_path):
                 assert cmd[cmd.index("--mode") + 1] == "projects"
 
 
+def test_maybe_auto_ingest_with_both_set(tmp_path):
+    """When MEMPAL_DIR and a transcript are both set, BOTH spawns happen."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    transcript = convo_dir / "session.jsonl"
+    transcript.write_text("")
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli._MINE_PID_FILE", tmp_path / "mine.pid"):
+                with patch("mempalace.hooks_cli.subprocess.Popen") as mock_popen:
+                    _maybe_auto_ingest(str(transcript))
+    assert mock_popen.call_count == 2
+    cmds = [call.args[0] for call in mock_popen.call_args_list]
+    modes = {cmd[cmd.index("--mode") + 1] for cmd in cmds}
+    assert modes == {"projects", "convos"}
+
+
+def test_mine_sync_with_both_set(tmp_path):
+    """Precompact sync runs BOTH mines when MEMPAL_DIR + transcript are set."""
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    transcript = convo_dir / "session.jsonl"
+    transcript.write_text("")
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        with patch("mempalace.hooks_cli.STATE_DIR", tmp_path):
+            with patch("mempalace.hooks_cli.subprocess.run") as mock_run:
+                _mine_sync(str(transcript))
+    assert mock_run.call_count == 2
+    cmds = [call.args[0] for call in mock_run.call_args_list]
+    modes = {cmd[cmd.index("--mode") + 1] for cmd in cmds}
+    assert modes == {"projects", "convos"}
+
+
 def test_maybe_auto_ingest_oserror(tmp_path):
     """OSError during subprocess spawn is silenced."""
     mempal_dir = tmp_path / "project"
@@ -550,70 +587,90 @@ def test_mine_already_running_corrupt_file(tmp_path):
         assert _mine_already_running() is False
 
 
-# --- _get_mine_dir ---
+# --- _get_mine_targets ---
 
 
-def test_get_mine_dir_mempal_dir(tmp_path):
-    """MEMPAL_DIR takes priority, is expanded/resolved, and is treated as projects mode."""
+def test_get_mine_targets_mempal_dir_only(tmp_path):
+    """MEMPAL_DIR alone yields a single projects target, expanded/resolved."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
-    transcript = tmp_path / "t.jsonl"
-    transcript.write_text("")
     with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
-        result_dir, result_mode = _get_mine_dir(str(transcript))
-        assert Path(result_dir).resolve() == mempal_dir.resolve()
-        assert result_mode == "projects"
+        targets = _get_mine_targets("")
+    assert len(targets) == 1
+    assert Path(targets[0][0]).resolve() == mempal_dir.resolve()
+    assert targets[0][1] == "projects"
 
 
-def test_get_mine_dir_mempal_dir_tilde(tmp_path):
+def test_get_mine_targets_mempal_dir_tilde(tmp_path):
     """MEMPAL_DIR with a tilde prefix is expanded correctly."""
     mempal_dir = tmp_path / "project"
     mempal_dir.mkdir()
     home = Path.home()
-    # Build a ~-relative path only if tmp_path is inside home
     try:
         rel = mempal_dir.relative_to(home)
     except ValueError:
         pytest.skip("tmp_path is not under home, cannot build ~-relative path")
     tilde_path = "~/" + str(rel)
     with patch.dict("os.environ", {"MEMPAL_DIR": tilde_path}):
-        result_dir, result_mode = _get_mine_dir("")
-        assert Path(result_dir).resolve() == mempal_dir.resolve()
-        assert result_mode == "projects"
+        targets = _get_mine_targets("")
+    assert len(targets) == 1
+    assert Path(targets[0][0]).resolve() == mempal_dir.resolve()
+    assert targets[0][1] == "projects"
 
 
-def test_get_mine_dir_transcript_fallback(tmp_path):
-    """Transcript fallback resolves to its parent dir in convos mode."""
+def test_get_mine_targets_transcript_only(tmp_path):
+    """A valid transcript JSONL alone yields a single convos target."""
     transcript = tmp_path / "t.jsonl"
     transcript.write_text("")
     with patch.dict("os.environ", {}, clear=True):
-        result_dir, result_mode = _get_mine_dir(str(transcript))
-        assert Path(result_dir).resolve() == tmp_path.resolve()
-        assert result_mode == "convos"
+        targets = _get_mine_targets(str(transcript))
+    assert len(targets) == 1
+    assert Path(targets[0][0]).resolve() == tmp_path.resolve()
+    assert targets[0][1] == "convos"
 
 
-def test_get_mine_dir_transcript_path_traversal_rejected(tmp_path):
-    """Transcript paths with '..' components are rejected and return no dir."""
+def test_get_mine_targets_both_set(tmp_path):
+    """When MEMPAL_DIR and a valid transcript are both set, BOTH targets appear.
+
+    This is the regression that motivates the additive-targets design:
+    users who set MEMPAL_DIR previously had their conversations silently
+    skipped because MEMPAL_DIR overrode the transcript path.
+    """
+    mempal_dir = tmp_path / "project"
+    mempal_dir.mkdir()
+    convo_dir = tmp_path / "convos"
+    convo_dir.mkdir()
+    transcript = convo_dir / "session.jsonl"
+    transcript.write_text("")
+    with patch.dict("os.environ", {"MEMPAL_DIR": str(mempal_dir)}):
+        targets = _get_mine_targets(str(transcript))
+    modes = {mode for _, mode in targets}
+    assert modes == {"projects", "convos"}
+    by_mode = {mode: Path(d) for d, mode in targets}
+    assert by_mode["projects"].resolve() == mempal_dir.resolve()
+    assert by_mode["convos"].resolve() == convo_dir.resolve()
+
+
+def test_get_mine_targets_transcript_path_traversal_rejected(tmp_path):
+    """Transcript paths with '..' components are rejected (no convos target)."""
     with patch.dict("os.environ", {}, clear=True):
-        result_dir, result_mode = _get_mine_dir("../../etc/passwd")
-        assert result_dir == ""
-        assert result_mode == "projects"
+        targets = _get_mine_targets("../../etc/passwd")
+    assert targets == []
 
 
-def test_get_mine_dir_transcript_non_jsonl_rejected(tmp_path):
+def test_get_mine_targets_transcript_non_jsonl_rejected(tmp_path):
     """Transcript paths without .jsonl/.json extension are rejected."""
     bad = tmp_path / "notes.txt"
     bad.write_text("content")
     with patch.dict("os.environ", {}, clear=True):
-        result_dir, result_mode = _get_mine_dir(str(bad))
-        assert result_dir == ""
-        assert result_mode == "projects"
+        targets = _get_mine_targets(str(bad))
+    assert targets == []
 
 
-def test_get_mine_dir_empty():
-    """Returns empty dir when nothing is available."""
+def test_get_mine_targets_empty():
+    """Returns empty list when nothing is available."""
     with patch.dict("os.environ", {}, clear=True):
-        assert _get_mine_dir("") == ("", "projects")
+        assert _get_mine_targets("") == []
 
 
 # --- _parse_harness_input ---

@@ -16,7 +16,8 @@ class TestSaveHookAutoMines:
 
     def test_hook_mines_transcript_path(self):
         """The hook receives TRANSCRIPT_PATH from Claude Code.
-        It should use that to mine the conversation, not depend on MEMPAL_DIR."""
+        It should use that to mine the conversation as --mode convos,
+        independently of MEMPAL_DIR (which is for project files only)."""
         hook_path = os.path.join(
             os.path.dirname(os.path.dirname(__file__)),
             "hooks",
@@ -24,23 +25,17 @@ class TestSaveHookAutoMines:
         )
         src = open(hook_path).read()
 
-        # The hook ALREADY receives TRANSCRIPT_PATH in the JSON input.
-        # It should use this to mine the current session's transcript
-        # regardless of whether MEMPAL_DIR is set.
-        # The hook must have a path that uses TRANSCRIPT_PATH to determine
-        # what to mine, separate from the MEMPAL_DIR path.
-        uses_transcript = "TRANSCRIPT_PATH" in src
-        has_mine = "mempalace mine" in src
-        # TRANSCRIPT_PATH must appear in the mining logic, not just the parse block
-        transcript_drives_mine = "MINE_DIR" in src and "dirname" in src and "TRANSCRIPT_PATH" in src
-
-        assert uses_transcript and has_mine and transcript_drives_mine, (
-            "Save hook only mines when MEMPAL_DIR is set (defaults to empty). "
-            "The hook receives TRANSCRIPT_PATH from Claude Code — it should "
-            "mine that file automatically so conversations are saved without "
-            "the user setting an env var. Currently the hook says 'saved in "
-            "background' but nothing actually saves."
-        )
+        # The hook must drive the conversation mine off TRANSCRIPT_PATH,
+        # using `dirname` to derive the parent dir, and tagging it with
+        # `--mode convos` so the convo miner runs (not the projects miner).
+        assert "TRANSCRIPT_PATH" in src, "hook must read transcript_path"
+        assert "mempalace mine" in src, "hook must invoke `mempalace mine`"
+        assert (
+            'dirname "$TRANSCRIPT_PATH"' in src
+        ), "hook must mine the transcript's parent directory"
+        assert (
+            "--mode convos" in src
+        ), "transcript mine must use --mode convos, not the projects miner"
 
     def test_mempal_dir_default_not_empty(self):
         """If MEMPAL_DIR is still used, it should have a sensible default,

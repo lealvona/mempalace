@@ -197,27 +197,27 @@ def _output(data: dict):
     sys.stdout.buffer.flush()
 
 
-def _get_mine_dir(transcript_path: str = "") -> tuple[str, str]:
-    """Determine directory to mine and the miner mode to use.
+def _get_mine_targets(transcript_path: str = "") -> list[tuple[str, str]]:
+    """Return the list of ``(dir, mode)`` targets for auto-ingest.
 
-    Returns ``(dir, mode)`` where ``mode`` is ``"projects"`` or ``"convos"``.
-    Empty ``dir`` means no ingest should run.
+    MEMPAL_DIR (when set and resolvable) contributes a ``"projects"``
+    target. A valid transcript JSONL contributes a ``"convos"`` target
+    on its parent dir. Both may appear together — the hook runs one
+    ingest per target, so a user with MEMPAL_DIR pointed at their
+    project dir still gets the active conversation mined verbatim.
 
-    MEMPAL_DIR is treated as a project directory ("projects" mode). The
-    transcript-path fallback resolves to the parent of a Claude Code
-    session JSONL, which must be mined with the conversation miner —
-    running the projects miner there ingests JSONL as if it were source
-    code.
+    An empty list means no ingest should run.
     """
+    targets: list[tuple[str, str]] = []
     mempal_dir = os.environ.get("MEMPAL_DIR", "")
     if mempal_dir:
         resolved = Path(mempal_dir).expanduser().resolve()
         if resolved.is_dir():
-            return str(resolved), "projects"
+            targets.append((str(resolved), "projects"))
     path = _validate_transcript_path(transcript_path)
     if path is not None and path.is_file():
-        return str(path.parent), "convos"
-    return "", "projects"
+        targets.append((str(path.parent), "convos"))
+    return targets
 
 
 _MINE_PID_FILE = STATE_DIR / "mine.pid"
@@ -275,36 +275,46 @@ def _spawn_mine(cmd: list) -> None:
 
 
 def _maybe_auto_ingest(transcript_path: str = ""):
-    """Run mempalace mine in background if a mine directory is available."""
-    mine_dir, mode = _get_mine_dir(transcript_path)
-    if not mine_dir:
+    """Run mempalace mine in background for every available target."""
+    targets = _get_mine_targets(transcript_path)
+    if not targets:
         return
     if _mine_already_running():
         _log("Skipping auto-ingest: mine already running")
         return
-    try:
-        _spawn_mine([sys.executable, "-m", "mempalace", "mine", mine_dir, "--mode", mode])
-    except OSError:
-        pass
+    for mine_dir, mode in targets:
+        try:
+            _spawn_mine([sys.executable, "-m", "mempalace", "mine", mine_dir, "--mode", mode])
+        except OSError:
+            pass
 
 
 def _mine_sync(transcript_path: str = ""):
-    """Run mempalace mine synchronously (for precompact -- data must land first)."""
-    mine_dir, mode = _get_mine_dir(transcript_path)
-    if not mine_dir:
+    """Run mempalace mine synchronously for every target (precompact)."""
+    targets = _get_mine_targets(transcript_path)
+    if not targets:
         return
-    try:
-        STATE_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = STATE_DIR / "hook.log"
-        with open(log_path, "a") as log_f:
-            subprocess.run(
-                [sys.executable, "-m", "mempalace", "mine", mine_dir, "--mode", mode],
-                stdout=log_f,
-                stderr=log_f,
-                timeout=60,
-            )
-    except (OSError, subprocess.TimeoutExpired):
-        pass
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = STATE_DIR / "hook.log"
+    for mine_dir, mode in targets:
+        try:
+            with open(log_path, "a") as log_f:
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "mempalace",
+                        "mine",
+                        mine_dir,
+                        "--mode",
+                        mode,
+                    ],
+                    stdout=log_f,
+                    stderr=log_f,
+                    timeout=60,
+                )
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
 
 def _desktop_toast(body: str, title: str = "MemPalace"):

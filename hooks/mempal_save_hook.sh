@@ -45,10 +45,10 @@
 # stop_hook_active=true so we let it through. No infinite loop.
 #
 # === MEMPALACE CLI ===
-# This repo uses: mempalace mine <dir>
-# or:            mempalace mine <dir> --mode convos
-# Set MEMPAL_DIR below if you want the hook to auto-ingest after blocking.
-# Leave blank to rely on the AI's own save instructions.
+# The hook ALWAYS mines the active conversation transcript automatically
+# (via `mempalace mine <transcript-dir> --mode convos`). MEMPAL_DIR is an
+# *additional*, optional target for project files — it does not replace
+# the conversation mine.
 #
 # === CONFIGURATION ===
 
@@ -56,9 +56,10 @@ SAVE_INTERVAL=15  # Save every N human messages (adjust to taste)
 STATE_DIR="$HOME/.mempalace/hook_state"
 mkdir -p "$STATE_DIR"
 
-# Optional: set to the directory you want auto-ingested on each save trigger.
-# Example: MEMPAL_DIR="$HOME/conversations"
-# Leave empty to skip auto-ingest (AI handles saving via the block reason).
+# Optional: project directory (code / notes / docs) to also mine each
+# save trigger. Mined with `--mode projects`. The conversation transcript
+# is always mined regardless — this is purely additive.
+# Example: MEMPAL_DIR="$HOME/projects/my_app"
 MEMPAL_DIR=""
 
 # Resolve the Python interpreter the hook should use.
@@ -157,19 +158,20 @@ if [ "$SINCE_LAST" -ge "$SAVE_INTERVAL" ] && [ "$EXCHANGE_COUNT" -gt 0 ]; then
 
     echo "[$(date '+%H:%M:%S')] TRIGGERING SAVE at exchange $EXCHANGE_COUNT" >> "$STATE_DIR/hook.log"
 
-    # Auto-mine the transcript. Two paths:
-    # 1. TRANSCRIPT_PATH (from Claude Code) — mine the directory it lives in
-    # 2. MEMPAL_DIR (user-configured) — mine that directory
-    # At least one should work. If neither is set, nothing mines.
-    MINE_DIR=""
+    # Auto-mine. Two independent targets — both run if both are set:
+    #   1. TRANSCRIPT_PATH (from Claude Code) → parent dir, --mode convos
+    #      (Claude Code session JSONL — must use the convo miner)
+    #   2. MEMPAL_DIR (user-configured project) → --mode projects
+    #      (code, notes, docs)
+    # MEMPAL_DIR is *additive*, not an override: a user with MEMPAL_DIR
+    # pointed at their project still gets the active conversation mined.
     if [ -n "$TRANSCRIPT_PATH" ] && [ -f "$TRANSCRIPT_PATH" ]; then
-        MINE_DIR="$(dirname "$TRANSCRIPT_PATH")"
+        mempalace mine "$(dirname "$TRANSCRIPT_PATH")" --mode convos \
+            >> "$STATE_DIR/hook.log" 2>&1 &
     fi
     if [ -n "$MEMPAL_DIR" ] && [ -d "$MEMPAL_DIR" ]; then
-        MINE_DIR="$MEMPAL_DIR"
-    fi
-    if [ -n "$MINE_DIR" ]; then
-        mempalace mine "$MINE_DIR" >> "$STATE_DIR/hook.log" 2>&1 &
+        mempalace mine "$MEMPAL_DIR" --mode projects \
+            >> "$STATE_DIR/hook.log" 2>&1 &
     fi
 
     # MEMPAL_VERBOSE toggle:
