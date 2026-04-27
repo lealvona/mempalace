@@ -507,6 +507,7 @@ def test_fix_blob_seq_ids_skips_sqlite_when_marker_present(tmp_path):
 
     mock_connect.assert_not_called()
 
+
 # ── quarantine_stale_hnsw ─────────────────────────────────────────────────
 
 

@@ -561,12 +561,13 @@ def _fix_blob_seq_ids(palace_path: str) -> None:
                     "Skipped %d sysdb-10-format BLOB seq_id(s) in embeddings (not converting)",
                     skipped,
                 )
-            if not safe_rows:
-                return
-            updates = [(int.from_bytes(blob, byteorder="big"), rowid) for rowid, blob in safe_rows]
-            conn.executemany("UPDATE embeddings SET seq_id = ? WHERE rowid = ?", updates)
-            logger.info("Fixed %d BLOB seq_ids in embeddings", len(updates))
-            conn.commit()
+            if safe_rows:
+                updates = [
+                    (int.from_bytes(blob, byteorder="big"), rowid) for rowid, blob in safe_rows
+                ]
+                conn.executemany("UPDATE embeddings SET seq_id = ? WHERE rowid = ?", updates)
+                logger.info("Fixed %d BLOB seq_ids in embeddings", len(updates))
+                conn.commit()
     except Exception:
         logger.exception("Could not fix BLOB seq_ids in %s", db_path)
         return
