@@ -2,7 +2,7 @@
 """
 MemPalace MCP Server — read/write palace access for Claude Code
 ================================================================
-Install: claude mcp add mempalace -- python -m mempalace.mcp_server [--palace /path/to/palace]
+Install: claude mcp add mempalace -- mempalace-mcp [--palace /path/to/palace]
 
 Tools (read):
   mempalace_status          — total drawers, wing/room breakdown
@@ -46,6 +46,7 @@ import argparse  # noqa: E402  (deferred until after stdio protection above)
 import json  # noqa: E402
 import logging  # noqa: E402
 import hashlib  # noqa: E402
+import random  # noqa: E402
 import time  # noqa: E402
 from datetime import datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -57,7 +58,13 @@ from .config import (  # noqa: E402
     sanitize_content,
 )
 from .version import __version__  # noqa: E402
-from .backends.chroma import ChromaBackend, ChromaCollection  # noqa: E402
+from .backends.chroma import (  # noqa: E402
+    ChromaBackend,
+    ChromaCollection,
+    _HNSW_BLOAT_GUARD,
+    _pin_hnsw_threads,
+    hnsw_capacity_status,
+)
 from .query_sanitizer import sanitize_query  # noqa: E402
 from .searcher import search_memories  # noqa: E402
 from .palace_graph import (  # noqa: E402
@@ -107,6 +114,55 @@ _client_cache = None
 _collection_cache = None
 _palace_db_inode = 0  # inode of chroma.sqlite3 at cache time
 _palace_db_mtime = 0.0  # mtime of chroma.sqlite3 at cache time
+
+# ── Vector-search disabled flag (#1222) ──────────────────────────────────
+# Set when ``hnsw_capacity_status`` reports a divergence between sqlite
+# and the HNSW segment large enough that chromadb would segfault on
+# segment load. While this is set, vector-shaped tools (``search``,
+# ``check_duplicate``) route to the sqlite-only BM25 fallback in
+# :func:`mempalace.searcher._bm25_only_via_sqlite`. Cleared after a
+# successful repair via :func:`tool_reconnect` (which re-runs the probe).
+_vector_disabled = False
+_vector_disabled_reason = ""
+# Optional[dict] (not ``dict | None``) keeps Python 3.9 import-time
+# parsing happy — PEP 604 unions in annotations only became unconditional
+# at module-eval time in 3.10.
+_vector_capacity_status = None  # type: Optional[dict]
+
+
+def _refresh_vector_disabled_flag() -> None:
+    """Re-run the HNSW capacity probe and update the module-level flag.
+
+    Called from :func:`_get_client` whenever the client cache is rebuilt
+    (first open or palace replacement). Cheap — pure sqlite + pickle
+    read, no chromadb interaction. Never raises: a probe that crashes
+    would defeat the point.
+    """
+    global _vector_disabled, _vector_disabled_reason, _vector_capacity_status
+    try:
+        info = hnsw_capacity_status(_config.palace_path, "mempalace_drawers")
+    except Exception:
+        logger.debug("HNSW capacity probe raised", exc_info=True)
+        return
+    _vector_capacity_status = info
+    if info.get("diverged"):
+        if not _vector_disabled:
+            logger.warning(
+                "HNSW capacity divergence detected (%s) — routing search to "
+                "BM25-only sqlite fallback. Run `mempalace repair` to restore "
+                "vector search.",
+                info.get("message", "unknown"),
+            )
+        _vector_disabled = True
+        _vector_disabled_reason = info.get("message", "")
+    else:
+        if _vector_disabled:
+            logger.info(
+                "HNSW capacity within tolerance (%s) — vector search re-enabled",
+                info.get("message", ""),
+            )
+        _vector_disabled = False
+        _vector_disabled_reason = ""
 
 
 # ==================== WRITE-AHEAD LOG ====================
@@ -202,6 +258,11 @@ def _get_client():
     mtime_changed = current_mtime != 0.0 and abs(current_mtime - _palace_db_mtime) > 0.01
 
     if _client_cache is None or inode_changed or mtime_changed:
+        # Run the HNSW capacity probe BEFORE chromadb opens the segment —
+        # if the index is severely undersized, segment load can segfault
+        # the whole MCP server (#1222). The probe is pure sqlite +
+        # metadata-pickle read; never touches the HNSW binary files.
+        _refresh_vector_disabled_flag()
         _client_cache = ChromaBackend.make_client(_config.palace_path)
         _collection_cache = None
         _metadata_cache = None
@@ -217,15 +278,29 @@ def _get_collection(create=False):
     try:
         client = _get_client()
         if create:
-            _collection_cache = ChromaCollection(
-                client.get_or_create_collection(
-                    _config.collection_name, metadata={"hnsw:space": "cosine"}
-                )
+            # hnsw:num_threads=1 disables ChromaDB's multi-threaded ParallelFor
+            # HNSW insert path, which has a race in repairConnectionsForUpdate /
+            # addPoint (see issues #974, #965). Set via metadata on fresh
+            # collections and re-applied via _pin_hnsw_threads() for legacy
+            # palaces whose collections were created before this fix (the
+            # runtime config does not persist cross-process in chromadb 1.5.x,
+            # so the retrofit runs every time _get_collection opens a cache).
+            raw = client.get_or_create_collection(
+                _config.collection_name,
+                metadata={
+                    "hnsw:space": "cosine",
+                    "hnsw:num_threads": 1,
+                    **_HNSW_BLOAT_GUARD,
+                },
             )
+            _pin_hnsw_threads(raw)
+            _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
             _metadata_cache_time = 0
         elif _collection_cache is None:
-            _collection_cache = ChromaCollection(client.get_collection(_config.collection_name))
+            raw = client.get_collection(_config.collection_name)
+            _pin_hnsw_threads(raw)
+            _collection_cache = ChromaCollection(raw)
             _metadata_cache = None
             _metadata_cache_time = 0
         return _collection_cache
@@ -285,7 +360,7 @@ def _get_cached_metadata(col, where=None):
 
 def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
     """Validate optional wing/room-style filters."""
-    if value is None:
+    if value is None or not value.strip():
         return None
     return sanitize_name(value, field_name)
 
@@ -293,11 +368,91 @@ def _sanitize_optional_name(value: str = None, field_name: str = "name") -> str:
 # ==================== READ TOOLS ====================
 
 
+def _tool_status_via_sqlite() -> dict:
+    """Pure-sqlite status reader for the #1222 fallback path.
+
+    When the HNSW capacity probe detects divergence, opening the chromadb
+    persistent client can segfault. This reader pulls the same wing/room
+    breakdown directly from ``embedding_metadata`` so the operator still
+    gets a working status response — and crucially the
+    ``vector_disabled`` flag — without us touching the vector segment.
+    """
+    import sqlite3 as _sqlite3
+
+    db_path = os.path.join(_config.palace_path, "chroma.sqlite3")
+    if not os.path.isfile(db_path):
+        return _no_palace()
+
+    wings: dict = {}
+    rooms: dict = {}
+    total = 0
+    try:
+        conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        try:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM embeddings e
+                JOIN segments s ON e.segment_id = s.id
+                JOIN collections c ON s.collection = c.id
+                WHERE c.name = 'mempalace_drawers'
+                """
+            ).fetchone()
+            total = int(row[0]) if row and row[0] is not None else 0
+            for key, target in (("wing", wings), ("room", rooms)):
+                for value, count in conn.execute(
+                    """
+                    SELECT em.string_value, COUNT(*)
+                    FROM embedding_metadata em
+                    JOIN embeddings e ON em.id = e.id
+                    JOIN segments s ON e.segment_id = s.id
+                    JOIN collections c ON s.collection = c.id
+                    WHERE c.name = 'mempalace_drawers'
+                      AND em.key = ?
+                      AND em.string_value IS NOT NULL
+                    GROUP BY em.string_value
+                    """,
+                    (key,),
+                ):
+                    target[value] = count
+        finally:
+            conn.close()
+    except _sqlite3.Error:
+        logger.exception("tool_status sqlite fallback read failed")
+
+    result = {
+        "total_drawers": total,
+        "wings": wings,
+        "rooms": rooms,
+        "palace_path": _config.palace_path,
+        "protocol": PALACE_PROTOCOL,
+        "aaak_dialect": AAAK_SPEC,
+        "vector_disabled": True,
+        "vector_disabled_reason": _vector_disabled_reason,
+    }
+    if _vector_capacity_status:
+        result["hnsw_capacity"] = {
+            "sqlite_count": _vector_capacity_status.get("sqlite_count"),
+            "hnsw_count": _vector_capacity_status.get("hnsw_count"),
+            "divergence": _vector_capacity_status.get("divergence"),
+        }
+    return result
+
+
 def tool_status():
+    # Run the safe sqlite/pickle probe before we touch chromadb. In the
+    # #1222 failure mode, opening the persistent client to call .count()
+    # can segfault — short-circuit to a pure-sqlite path when divergence
+    # is detected so status stays reachable.
+    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
+    _refresh_vector_disabled_flag()
+
+    if _vector_disabled:
+        return _tool_status_via_sqlite()
+
     # Use create=True only when a palace DB already exists on disk -- this
     # bootstraps the ChromaDB collection on a valid-but-empty palace without
     # accidentally creating a palace in a non-existent directory (#830).
-    db_exists = os.path.isfile(os.path.join(_config.palace_path, "chroma.sqlite3"))
     col = _get_collection(create=db_exists)
     if not col:
         return _no_palace()
@@ -446,6 +601,11 @@ def tool_search(
     dist = (1.0 - min_similarity) if min_similarity is not None else max_distance
     # Mitigate system prompt contamination (Issue #333)
     sanitized = sanitize_query(query)
+    # Ensure the vector-disabled probe has been run via the safe
+    # sqlite/pickle path before we touch chromadb. Calling _get_client()
+    # here would defeat the fallback — it constructs a PersistentClient
+    # which can segfault on segment load in the #1222 failure mode.
+    _refresh_vector_disabled_flag()
     result = search_memories(
         sanitized["clean_query"],
         palace_path=_config.palace_path,
@@ -453,7 +613,11 @@ def tool_search(
         room=room,
         n_results=limit,
         max_distance=dist,
+        vector_disabled=_vector_disabled,
     )
+    if _vector_disabled:
+        result["vector_disabled"] = True
+        result["vector_disabled_reason"] = _vector_disabled_reason
     # Attach sanitizer metadata for transparency
     if sanitized["was_sanitized"]:
         result["query_sanitized"] = True
@@ -472,6 +636,20 @@ def tool_check_duplicate(content: str, threshold: float = 0.9):
     col = _get_collection()
     if not col:
         return _no_palace()
+    if _vector_disabled:
+        # Without a usable HNSW we can't compute cosine similarity for
+        # near-duplicate detection. Report the limitation rather than
+        # silently returning "not a duplicate" — false negatives here
+        # would let the AI re-file content the palace already holds.
+        return {
+            "is_duplicate": False,
+            "matches": [],
+            "vector_disabled": True,
+            "vector_disabled_reason": _vector_disabled_reason,
+            "hint": (
+                "duplicate detection requires vector search; run " "`mempalace repair` to restore"
+            ),
+        }
     try:
         results = col.query(
             query_texts=[content],
@@ -603,7 +781,12 @@ def tool_follow_tunnels(wing: str, room: str):
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    source: str = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first."""
     global _metadata_cache
@@ -651,6 +834,7 @@ def tool_add_drawer(
                     "wing": wing,
                     "room": room,
                     "source_file": source_file or "",
+                    "source": source or source_file or "mcp_interactive",
                     "chunk_index": 0,
                     "added_by": added_by,
                     "filed_at": datetime.now().isoformat(),
@@ -688,9 +872,88 @@ def tool_delete_drawer(drawer_id: str):
 
     try:
         col.delete(ids=[drawer_id])
+        # Best-effort companion (AAAK) cleanup
+        try:
+            col.delete(ids=[drawer_id + "_01"])
+        except Exception:
+            pass
         _metadata_cache = None
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def tool_delete_drawers_by_filter(
+    wing: str = None, room: str = None, source_file: str = None
+):
+    """Bulk-delete drawers matching wing, room, and/or source_file filters."""
+    global _metadata_cache
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    # Validate provided names
+    try:
+        if wing is not None:
+            wing = sanitize_name(wing, "wing")
+        if room is not None:
+            room = sanitize_name(room, "room")
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    if wing is None and room is None and source_file is None:
+        return {
+            "success": False,
+            "error": "At least one of wing, room, or source_file must be provided",
+        }
+
+    # Build ChromaDB where filter
+    conditions = []
+    if wing is not None:
+        conditions.append({"wing": wing})
+    if room is not None:
+        conditions.append({"room": room})
+    if source_file is not None:
+        conditions.append({"source_file": source_file})
+
+    if len(conditions) == 1:
+        where_filter = conditions[0]
+    else:
+        where_filter = {"$and": conditions}
+
+    try:
+        matching = col.get(where=where_filter, include=[])
+        ids_to_delete = matching["ids"]
+        if not ids_to_delete:
+            return {"success": True, "deleted_count": 0, "deleted_ids": []}
+
+        # Also collect companion (AAAK) IDs for best-effort cleanup
+        companion_ids = [did + "_01" for did in ids_to_delete]
+        all_ids = ids_to_delete + companion_ids
+
+        _wal_log(
+            "delete_drawers_by_filter",
+            {
+                "wing": wing,
+                "room": room,
+                "source_file": source_file,
+                "deleted_count": len(ids_to_delete),
+                "deleted_ids": ids_to_delete,
+            },
+        )
+
+        col.delete(ids=all_ids)
+        _metadata_cache = None
+        logger.info(
+            f"Bulk deleted {len(ids_to_delete)} drawers (wing={wing}, room={room}, "
+            f"source_file={source_file})"
+        )
+        return {
+            "success": True,
+            "deleted_count": len(ids_to_delete),
+            "deleted_ids": ids_to_delete,
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -853,7 +1116,12 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
 
 
 def tool_kg_add(
-    subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None
+    subject: str,
+    predicate: str,
+    object: str,
+    valid_from: str = None,
+    source_closet: str = None,
+    confidence: float = None,
 ):
     """Add a relationship to the knowledge graph."""
     try:
@@ -871,12 +1139,20 @@ def tool_kg_add(
             "object": object,
             "valid_from": valid_from,
             "source_closet": source_closet,
+            "confidence": confidence,
         },
     )
+
+    # Default confidence to 1.0 if not provided
+    conf = confidence if confidence is not None else 1.0
     triple_id = _kg.add_triple(
-        subject, predicate, object, valid_from=valid_from, source_closet=source_closet
+        subject, predicate, object, valid_from=valid_from, source_closet=source_closet, confidence=conf
     )
-    return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+
+    result = {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+    if confidence is not None and confidence < 0.5:
+        result["warning"] = f"Low confidence ({confidence}) — verify this fact before relying on it"
+    return result
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
@@ -918,10 +1194,10 @@ def tool_kg_stats():
 # ==================== AGENT DIARY ====================
 
 
-def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
+def tool_diary_write(agent_name: str, entry: str, topic: str = "general", wing: str = ""):
     """
-    Write a diary entry for this agent. Each agent gets its own wing
-    with a diary room. Entries are timestamped and accumulate over time.
+    Write a diary entry for this agent. Entries are timestamped and
+    accumulate over time in a diary room.
 
     This is the agent's personal journal — observations, thoughts,
     what it worked on, what it noticed, what it thinks matters.
@@ -929,10 +1205,14 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
     try:
         agent_name = sanitize_name(agent_name, "agent_name")
         entry = sanitize_content(entry)
+        topic = sanitize_name(topic, "topic")
     except ValueError as e:
         return {"success": False, "error": str(e)}
 
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
+    if wing:
+        wing = sanitize_name(wing)
+    else:
+        wing = f"wing_{agent_name.lower().replace(' ', '_')}"
     room = "diary"
     col = _get_collection(create=True)
     if not col:
@@ -987,24 +1267,38 @@ def tool_diary_write(agent_name: str, entry: str, topic: str = "general"):
         return {"success": False, "error": str(e)}
 
 
-def tool_diary_read(agent_name: str, last_n: int = 10):
+def tool_diary_read(agent_name: str, last_n: int = 10, wing: str = ""):
     """
     Read an agent's recent diary entries. Returns the last N entries
     in chronological order — the agent's personal journal.
+
+    When ``wing`` is provided, reads only from that wing. When ``wing``
+    is empty or omitted, returns entries from every wing this agent has
+    written to. Diary writes from hooks land in project-derived wings
+    (``wing_<project>``), so requiring a specific wing on read would
+    silo those entries from agent-initiated reads.
     """
     try:
         agent_name = sanitize_name(agent_name, "agent_name")
+        if wing:
+            wing = sanitize_name(wing)
     except ValueError as e:
         return {"error": str(e)}
     last_n = max(1, min(last_n, 100))
-    wing = f"wing_{agent_name.lower().replace(' ', '_')}"
     col = _get_collection()
     if not col:
         return _no_palace()
 
+    # Build filter: always scope by agent + room=diary. Wing is optional —
+    # when empty, return entries across all wings for this agent (matches
+    # the #1097 empty-string-as-no-filter convention for LLM ergonomics).
+    conditions = [{"room": "diary"}, {"agent": agent_name}]
+    if wing:
+        conditions.insert(0, {"wing": wing})
+
     try:
         results = col.get(
-            where={"$and": [{"wing": wing}, {"room": "diary"}]},
+            where={"$and": conditions},
             include=["documents", "metadatas"],
             limit=10000,
         )
@@ -1122,10 +1416,22 @@ def tool_reconnect():
     Use after external scripts or CLI commands modify the palace database
     directly, which can leave the in-memory HNSW index stale.
     """
-    global _collection_cache, _palace_db_inode, _palace_db_mtime
+    global \
+        _client_cache, \
+        _collection_cache, \
+        _palace_db_inode, \
+        _palace_db_mtime, \
+        _vector_disabled, \
+        _vector_disabled_reason
+    _client_cache = None
     _collection_cache = None
     _palace_db_inode = 0
     _palace_db_mtime = 0.0
+    # Force probe re-run on next _get_client by clearing the flag now;
+    # _refresh_vector_disabled_flag will re-set it if the divergence
+    # still applies after the reconnect.
+    _vector_disabled = False
+    _vector_disabled_reason = ""
     try:
         col = _get_collection()
         if col is None:
@@ -1133,10 +1439,73 @@ def tool_reconnect():
                 "success": False,
                 "message": "No palace found after reconnect",
                 "drawers": 0,
+                "vector_disabled": _vector_disabled,
             }
-        return {"success": True, "message": "Reconnected to palace", "drawers": col.count()}
+        return {
+            "success": True,
+            "message": "Reconnected to palace",
+            "drawers": col.count(),
+            "vector_disabled": _vector_disabled,
+            "vector_disabled_reason": _vector_disabled_reason,
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+# ==================== INTEGRITY CHECK ====================
+
+
+def tool_verify_palace_integrity():
+    """Verify palace integrity: count drawers, sample random IDs, fetch them."""
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    try:
+        # Get total count
+        all_ids = col.get(include=[])["ids"]
+        total_drawers = len(all_ids)
+
+        if total_drawers == 0:
+            return {
+                "healthy": True,
+                "total_drawers": 0,
+                "message": "Palace is empty — no integrity issues possible",
+            }
+
+        # Sample up to 5 random IDs and verify they can be fetched
+        sample_size = min(5, total_drawers)
+        sampled_ids = random.sample(all_ids, sample_size)
+
+        fetch_errors = []
+        try:
+            fetched = col.get(ids=sampled_ids, include=["documents", "metadatas"])
+            fetched_ids = fetched["ids"]
+            for sid in sampled_ids:
+                if sid not in fetched_ids:
+                    fetch_errors.append(sid)
+            # Check for empty documents
+            for i, doc in enumerate(fetched.get("documents", [])):
+                if not doc or not doc.strip():
+                    fetch_errors.append(fetched_ids[i] + " (empty document)")
+        except Exception as e:
+            fetch_errors.append(f"fetch_failed: {e}")
+
+        healthy = len(fetch_errors) == 0
+        result = {
+            "healthy": healthy,
+            "total_drawers": total_drawers,
+            "sampled": sample_size,
+            "fetch_errors": fetch_errors,
+        }
+        if healthy:
+            result["message"] = f"Palace integrity OK — {total_drawers} drawers, {sample_size} sampled and verified"
+        else:
+            result["message"] = f"Palace integrity issues — {len(fetch_errors)} errors in {sample_size} sampled drawers"
+
+        return result
+    except Exception as e:
+        return {"healthy": False, "error": str(e)}
 
 
 # ==================== MCP PROTOCOL ====================
@@ -1212,6 +1581,10 @@ TOOLS = {
                 "source_closet": {
                     "type": "string",
                     "description": "Closet ID where this fact appears (optional)",
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "Confidence score 0-1 (optional, default 1.0). Values below 0.5 trigger a warning.",
                 },
             },
             "required": ["subject", "predicate", "object"],
@@ -1408,6 +1781,10 @@ TOOLS = {
                 },
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "source": {
+                    "type": "string",
+                    "description": "Provenance source label (optional, defaults to source_file or 'mcp_interactive')",
+                },
             },
             "required": ["wing", "room", "content"],
         },
@@ -1423,6 +1800,18 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_delete_drawer,
+    },
+    "mempalace_delete_drawers_by_filter": {
+        "description": "Bulk-delete drawers matching wing, room, and/or source_file filters. Also cleans up AAAK companions. At least one filter required.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Filter by wing (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "source_file": {"type": "string", "description": "Filter by source file (optional)"},
+            },
+        },
+        "handler": tool_delete_drawers_by_filter,
     },
     "mempalace_get_drawer": {
         "description": "Fetch a single drawer by ID — returns full content and metadata.",
@@ -1497,6 +1886,10 @@ TOOLS = {
                     "type": "string",
                     "description": "Topic tag (optional, default: general)",
                 },
+                "wing": {
+                    "type": "string",
+                    "description": "Target wing for this diary entry (optional). If omitted, uses wing_{agent_name}. Use this to write diary entries to a project wing instead of an agent-specific wing.",
+                },
             },
             "required": ["agent_name", "entry"],
         },
@@ -1514,6 +1907,10 @@ TOOLS = {
                 "last_n": {
                     "type": "integer",
                     "description": "Number of recent entries to read (default: 10)",
+                },
+                "wing": {
+                    "type": "string",
+                    "description": "Wing to read diary entries from (optional). If omitted, reads from wing_{agent_name}.",
                 },
             },
             "required": ["agent_name"],
@@ -1556,6 +1953,11 @@ TOOLS = {
             "properties": {},
         },
         "handler": tool_reconnect,
+    },
+    "mempalace_verify_palace_integrity": {
+        "description": "Verify palace integrity — counts drawers, samples random IDs, and checks they are fetchable. Returns health status.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_verify_palace_integrity,
     },
 }
 
@@ -1690,6 +2092,10 @@ def _restore_stdout():
 def main():
     _restore_stdout()
     logger.info("MemPalace MCP Server starting...")
+    # Pre-flight: probe HNSW capacity before any tool call so the warning
+    # is visible at startup rather than on first use (#1222). Pure
+    # filesystem read; never opens a chromadb client.
+    _refresh_vector_disabled_flag()
     while True:
         try:
             line = sys.stdin.readline()
