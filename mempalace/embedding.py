@@ -112,6 +112,10 @@ class RemoteEmbeddingFunction:
         """Return ``'default'`` for ChromaDB collection compatibility."""
         return "default"
 
+    def embed_query(self, input: list[str]) -> list[list[float]]:
+        """ChromaDB 1.5+ entry point for query-time embeddings."""
+        return self(input)
+
     def __call__(self, input: list[str]) -> list[list[float]]:
         """Embed a batch of strings and return float vectors.
 
