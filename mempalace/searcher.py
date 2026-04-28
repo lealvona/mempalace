@@ -604,7 +604,7 @@ def search_memories(
         dkwargs = {
             "query_texts": [query],
             "n_results": n_results * 3,  # over-fetch for re-ranking
-            "include": ["documents", "metadatas", "distances"],
+            "include": ["documents", "metadatas", "distances", "ids"],
         }
         if where:
             dkwargs["where"] = where
@@ -645,10 +645,11 @@ def search_memories(
     CLOSET_DISTANCE_CAP = 1.5  # cosine dist > 1.5 = too weak to use as signal
 
     scored: list = []
-    for doc, meta, dist in zip(
+    for doc, meta, dist, drawer_id in zip(
         _first_or_empty(drawer_results, "documents"),
         _first_or_empty(drawer_results, "metadatas"),
         _first_or_empty(drawer_results, "distances"),
+        _first_or_empty(drawer_results, "ids"),
     ):
         # Filter on raw distance before rounding to avoid precision loss.
         if max_distance > 0.0 and dist > max_distance:
@@ -669,6 +670,7 @@ def search_memories(
         effective_dist = dist - boost
         entry = {
             "text": doc,
+            "drawer_id": drawer_id,
             "wing": meta.get("wing", "unknown"),
             "room": meta.get("room", "unknown"),
             "source_file": Path(source).name if source else "?",
