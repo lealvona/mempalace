@@ -46,6 +46,7 @@ import argparse  # noqa: E402  (deferred until after stdio protection above)
 import json  # noqa: E402
 import logging  # noqa: E402
 import hashlib  # noqa: E402
+import random  # noqa: E402
 import time  # noqa: E402
 from datetime import datetime  # noqa: E402
 from pathlib import Path  # noqa: E402
@@ -780,7 +781,12 @@ def tool_follow_tunnels(wing: str, room: str):
 
 
 def tool_add_drawer(
-    wing: str, room: str, content: str, source_file: str = None, added_by: str = "mcp"
+    wing: str,
+    room: str,
+    content: str,
+    source_file: str = None,
+    added_by: str = "mcp",
+    source: str = None,
 ):
     """File verbatim content into a wing/room. Checks for duplicates first."""
     global _metadata_cache
@@ -828,6 +834,7 @@ def tool_add_drawer(
                     "wing": wing,
                     "room": room,
                     "source_file": source_file or "",
+                    "source": source or source_file or "mcp_interactive",
                     "chunk_index": 0,
                     "added_by": added_by,
                     "filed_at": datetime.now().isoformat(),
@@ -865,9 +872,88 @@ def tool_delete_drawer(drawer_id: str):
 
     try:
         col.delete(ids=[drawer_id])
+        # Best-effort companion (AAAK) cleanup
+        try:
+            col.delete(ids=[drawer_id + "_01"])
+        except Exception:
+            pass
         _metadata_cache = None
         logger.info(f"Deleted drawer: {drawer_id}")
         return {"success": True, "drawer_id": drawer_id}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def tool_delete_drawers_by_filter(
+    wing: str = None, room: str = None, source_file: str = None
+):
+    """Bulk-delete drawers matching wing, room, and/or source_file filters."""
+    global _metadata_cache
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    # Validate provided names
+    try:
+        if wing is not None:
+            wing = sanitize_name(wing, "wing")
+        if room is not None:
+            room = sanitize_name(room, "room")
+    except ValueError as e:
+        return {"success": False, "error": str(e)}
+
+    if wing is None and room is None and source_file is None:
+        return {
+            "success": False,
+            "error": "At least one of wing, room, or source_file must be provided",
+        }
+
+    # Build ChromaDB where filter
+    conditions = []
+    if wing is not None:
+        conditions.append({"wing": wing})
+    if room is not None:
+        conditions.append({"room": room})
+    if source_file is not None:
+        conditions.append({"source_file": source_file})
+
+    if len(conditions) == 1:
+        where_filter = conditions[0]
+    else:
+        where_filter = {"$and": conditions}
+
+    try:
+        matching = col.get(where=where_filter, include=[])
+        ids_to_delete = matching["ids"]
+        if not ids_to_delete:
+            return {"success": True, "deleted_count": 0, "deleted_ids": []}
+
+        # Also collect companion (AAAK) IDs for best-effort cleanup
+        companion_ids = [did + "_01" for did in ids_to_delete]
+        all_ids = ids_to_delete + companion_ids
+
+        _wal_log(
+            "delete_drawers_by_filter",
+            {
+                "wing": wing,
+                "room": room,
+                "source_file": source_file,
+                "deleted_count": len(ids_to_delete),
+                "deleted_ids": ids_to_delete,
+            },
+        )
+
+        col.delete(ids=all_ids)
+        _metadata_cache = None
+        logger.info(
+            f"Bulk deleted {len(ids_to_delete)} drawers (wing={wing}, room={room}, "
+            f"source_file={source_file})"
+        )
+        return {
+            "success": True,
+            "deleted_count": len(ids_to_delete),
+            "deleted_ids": ids_to_delete,
+        }
     except Exception as e:
         return {"success": False, "error": str(e)}
 
@@ -1030,7 +1116,12 @@ def tool_kg_query(entity: str, as_of: str = None, direction: str = "both"):
 
 
 def tool_kg_add(
-    subject: str, predicate: str, object: str, valid_from: str = None, source_closet: str = None
+    subject: str,
+    predicate: str,
+    object: str,
+    valid_from: str = None,
+    source_closet: str = None,
+    confidence: float = None,
 ):
     """Add a relationship to the knowledge graph."""
     try:
@@ -1048,12 +1139,20 @@ def tool_kg_add(
             "object": object,
             "valid_from": valid_from,
             "source_closet": source_closet,
+            "confidence": confidence,
         },
     )
+
+    # Default confidence to 1.0 if not provided
+    conf = confidence if confidence is not None else 1.0
     triple_id = _kg.add_triple(
-        subject, predicate, object, valid_from=valid_from, source_closet=source_closet
+        subject, predicate, object, valid_from=valid_from, source_closet=source_closet, confidence=conf
     )
-    return {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+
+    result = {"success": True, "triple_id": triple_id, "fact": f"{subject} → {predicate} → {object}"}
+    if confidence is not None and confidence < 0.5:
+        result["warning"] = f"Low confidence ({confidence}) — verify this fact before relying on it"
+    return result
 
 
 def tool_kg_invalidate(subject: str, predicate: str, object: str, ended: str = None):
@@ -1353,6 +1452,62 @@ def tool_reconnect():
         return {"success": False, "error": str(e)}
 
 
+# ==================== INTEGRITY CHECK ====================
+
+
+def tool_verify_palace_integrity():
+    """Verify palace integrity: count drawers, sample random IDs, fetch them."""
+    col = _get_collection()
+    if not col:
+        return _no_palace()
+
+    try:
+        # Get total count
+        all_ids = col.get(include=[])["ids"]
+        total_drawers = len(all_ids)
+
+        if total_drawers == 0:
+            return {
+                "healthy": True,
+                "total_drawers": 0,
+                "message": "Palace is empty — no integrity issues possible",
+            }
+
+        # Sample up to 5 random IDs and verify they can be fetched
+        sample_size = min(5, total_drawers)
+        sampled_ids = random.sample(all_ids, sample_size)
+
+        fetch_errors = []
+        try:
+            fetched = col.get(ids=sampled_ids, include=["documents", "metadatas"])
+            fetched_ids = fetched["ids"]
+            for sid in sampled_ids:
+                if sid not in fetched_ids:
+                    fetch_errors.append(sid)
+            # Check for empty documents
+            for i, doc in enumerate(fetched.get("documents", [])):
+                if not doc or not doc.strip():
+                    fetch_errors.append(fetched_ids[i] + " (empty document)")
+        except Exception as e:
+            fetch_errors.append(f"fetch_failed: {e}")
+
+        healthy = len(fetch_errors) == 0
+        result = {
+            "healthy": healthy,
+            "total_drawers": total_drawers,
+            "sampled": sample_size,
+            "fetch_errors": fetch_errors,
+        }
+        if healthy:
+            result["message"] = f"Palace integrity OK — {total_drawers} drawers, {sample_size} sampled and verified"
+        else:
+            result["message"] = f"Palace integrity issues — {len(fetch_errors)} errors in {sample_size} sampled drawers"
+
+        return result
+    except Exception as e:
+        return {"healthy": False, "error": str(e)}
+
+
 # ==================== MCP PROTOCOL ====================
 
 TOOLS = {
@@ -1426,6 +1581,10 @@ TOOLS = {
                 "source_closet": {
                     "type": "string",
                     "description": "Closet ID where this fact appears (optional)",
+                },
+                "confidence": {
+                    "type": "number",
+                    "description": "Confidence score 0-1 (optional, default 1.0). Values below 0.5 trigger a warning.",
                 },
             },
             "required": ["subject", "predicate", "object"],
@@ -1622,6 +1781,10 @@ TOOLS = {
                 },
                 "source_file": {"type": "string", "description": "Where this came from (optional)"},
                 "added_by": {"type": "string", "description": "Who is filing this (default: mcp)"},
+                "source": {
+                    "type": "string",
+                    "description": "Provenance source label (optional, defaults to source_file or 'mcp_interactive')",
+                },
             },
             "required": ["wing", "room", "content"],
         },
@@ -1637,6 +1800,18 @@ TOOLS = {
             "required": ["drawer_id"],
         },
         "handler": tool_delete_drawer,
+    },
+    "mempalace_delete_drawers_by_filter": {
+        "description": "Bulk-delete drawers matching wing, room, and/or source_file filters. Also cleans up AAAK companions. At least one filter required.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "wing": {"type": "string", "description": "Filter by wing (optional)"},
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "source_file": {"type": "string", "description": "Filter by source file (optional)"},
+            },
+        },
+        "handler": tool_delete_drawers_by_filter,
     },
     "mempalace_get_drawer": {
         "description": "Fetch a single drawer by ID — returns full content and metadata.",
@@ -1778,6 +1953,11 @@ TOOLS = {
             "properties": {},
         },
         "handler": tool_reconnect,
+    },
+    "mempalace_verify_palace_integrity": {
+        "description": "Verify palace integrity — counts drawers, samples random IDs, and checks they are fetchable. Returns health status.",
+        "input_schema": {"type": "object", "properties": {}},
+        "handler": tool_verify_palace_integrity,
     },
 }
 
