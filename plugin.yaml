@@ -1,0 +1,14 @@
+name: mempalace
+version: 4.0.0-master
+manifest_version: 1
+description: >
+  MemPalace local-first verbatim memory for Hermes Agent.
+  Verbatim drawer storage, semantic search (ChromaDB + ONNX),
+  temporal knowledge graph (SQLite), and 8 Hermes tools
+  (search, add_drawer, status, kg_query, kg_add, diary_write,
+  list_wings, list_rooms). 96.6% R@5 on LongMemEval raw — no
+  API key required for the core retrieval path.
+pip_dependencies:
+  - "mempalace @ git+https://github.com/lealvona/mempalace.git@master"
+hooks:
+  - on_session_end
